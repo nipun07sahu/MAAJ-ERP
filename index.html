@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0f766e">
+  <title>MAAJ PHARMACY — Pharmacy Management</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <style>
+    body{background:#f5f7fb}
+    .glass{background:rgba(255,255,255,.78);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.8)}
+    .hide{display:none!important}
+    .nav-active{background:#0f766e!important;color:#fff!important}
+    .tab-in{animation:tabin .2s ease}
+    @keyframes tabin{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+    .drawer{transition:transform .25s ease}
+    .scrollbar::-webkit-scrollbar{width:7px;height:7px}.scrollbar::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:10px}
+    @media print{body *{visibility:hidden!important}.print-area,.print-area *{visibility:visible!important}.print-area{position:absolute!important;left:0!important;top:0!important;width:100%!important;background:#fff!important}}
+  </style>
+</head>
+<body class="text-slate-800">
+<!--
+SUPABASE SQL SETUP — RUN ONCE IN SUPABASE SQL EDITOR
+
+IMPORTANT:
+1. This application intentionally uses phone + password WITHOUT an OTP screen.
+2. In Supabase Dashboard -> Authentication -> Providers -> Phone, disable phone confirmation
+   if you want password signup/login without OTP. If phone confirmation remains enabled,
+   Supabase will require verification and a client-only application cannot bypass it safely.
+3. Never put a service_role/secret key in this HTML. Use only the publishable/anon key.
+4. Create Storage buckets here as private buckets.
+
+create extension if not exists pgcrypto;
+
+do $$ begin create type public.app_role as enum ('admin','staff','superadmin'); exception when duplicate_object then null; end $$;
+do $$ begin create type public.account_status as enum ('pending_superadmin','pending_store_admin','active','rejected','temporary_blocked','permanent_blocked'); exception when duplicate_object then null; end $$;
+do $$ begin create type public.payment_mode as enum ('cash','upi','card','credit'); exception when duplicate_object then null; end $$;
+do $$ begin create type public.bug_status as enum ('open','in_progress','resolved','closed'); exception when duplicate_object then null; end $$;
+
+create table if not exists public.pharmacy_stores(
+  id uuid primary key default gen_random_uuid(),
+  store_name text not null,
+  owner_name text not null,
+  pharmacist_name text,
+  drug_license_number text,
+  drug_license_path text,
+  gstin text,
+  pan text,
+  address text,
+  phone text,
+  email text,
+  digital_signature_path text,
+  created_by uuid references auth.users(id) on delete set null,
+  approved_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.profiles(
+  id uuid primary key references auth.users(id) on delete cascade,
+  store_id uuid references public.pharmacy_stores(id) on delete set null,
+  store_name text,
+  owner_name text,
+  pharmacist_name text,
+  full_name text,
+  mobile text not null,
+  email text,
+  role public.app_role not null default 'staff',
+  status public.account_status not null default 'pending_store_admin',
+  violation_count integer not null default 0,
+  last_violation_reason text,
+  blocked_at timestamptz,
+  blocked_until timestamptz,
+  approved_by uuid references auth.users(id) on delete set null,
+  approved_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create unique index if not exists profiles_mobile_unique on public.profiles(mobile);
+create unique index if not exists stores_license_unique on public.pharmacy_stores(drug_license_number) where drug_license_number is not null and drug_license_number <> '';
+
+create table if not exists public.inventory(
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.pharmacy_stores(id) on delete cascade,
+  medicine_name text not null,
+  generic_name text,
+  category text,
+  batch_number text not null,
+  expiry_date date not null,
+  mrp numeric(12,2) not null default 0,
+  purchase_rate numeric(12,2) not null default 0,
+  selling_rate numeric(12,2) not null default 0,
+  gst_percent numeric(5,2) not null default 0,
+  quantity integer not null default 0 check(quantity >= 0),
+  low_stock_threshold integer not null default 10 check(low_stock_threshold >= 0),
+  supplier_name text,
+  barcode text,
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(store_id,batch_number,medicine_name)
+);
+
+create table if not exists public.purchases(
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.pharmacy_stores(id) on delete cascade,
+  supplier_name text,
+  invoice_number text,
+  invoice_date date default current_date,
+  taxable_amount numeric(12,2) not null default 0,
+  gst_amount numeric(12,2) not null default 0,
+  total_amount numeric(12,2) not null default 0,
+  raw_ocr text,
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.purchase_items(
+  id uuid primary key default gen_random_uuid(),
+  purchase_id uuid not null references public.purchases(id) on delete cascade,
+  inventory_id uuid references public.inventory(id) on delete set null,
+  medicine_name text not null,
+  batch_number text,
+  expiry_date date,
+  mrp numeric(12,2) default 0,
+  purchase_rate numeric(12,2) default 0,
+  taxable_amount numeric(12,2) default 0,
+  gst_percent numeric(5,2) default 0,
+  quantity integer default 0
+);
+
+create table if not exists public.sales(
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.pharmacy_stores(id) on delete cascade,
+  invoice_number text not null,
+  customer_name text,
+  customer_phone text,
+  payment_mode public.payment_mode not null,
+  subtotal numeric(12,2) not null default 0,
+  discount numeric(12,2) not null default 0,
+  cgst numeric(12,2) not null default 0,
+  sgst numeric(12,2) not null default 0,
+  gst_total numeric(12,2) not null default 0,
+  total numeric(12,2) not null default 0,
+  status text not null default 'completed',
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.sale_items(
+  id uuid primary key default gen_random_uuid(),
+  sale_id uuid not null references public.sales(id) on delete cascade,
+  inventory_id uuid references public.inventory(id) on delete set null,
+  medicine_name text not null,
+  batch_number text,
+  quantity integer not null,
+  unit_price numeric(12,2) not null default 0,
+  gst_percent numeric(5,2) not null default 0,
+  line_total numeric(12,2) not null default 0
+);
+
+create table if not exists public.bugs(
+  id uuid primary key default gen_random_uuid(),
+  reporter_id uuid references auth.users(id) on delete set null,
+  store_id uuid references public.pharmacy_stores(id) on delete cascade,
+  title text not null,
+  description text,
+  screenshot_path text,
+  system_logs jsonb,
+  status public.bug_status not null default 'open',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.violations(
+  id uuid primary key default gen_random_uuid(),
+  profile_id uuid not null references public.profiles(id) on delete cascade,
+  store_id uuid references public.pharmacy_stores(id) on delete cascade,
+  reported_by uuid references auth.users(id) on delete set null,
+  reason text not null,
+  strike_number integer not null,
+  action_taken text not null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.expenses(
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.pharmacy_stores(id) on delete cascade,
+  description text not null,
+  amount numeric(12,2) not null,
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.drafts(
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references public.pharmacy_stores(id) on delete cascade,
+  created_by uuid not null references auth.users(id) on delete cascade,
+  payload jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create or replace function public.set_updated_at() returns trigger language plpgsql as $$
+begin new.updated_at=now(); return new; end $$;
+drop trigger if exists stores_updated on public.pharmacy_stores;
+create trigger stores_updated before update on public.pharmacy_stores for each row execute function public.set_updated_at();
+drop trigger if exists profiles_updated on public.profiles;
+create trigger profiles_updated before update on public.profiles for each row execute function public.set_updated_at();
+drop trigger if exists inventory_updated on public.inventory;
+create trigger inventory_updated before update on public.inventory for each row execute function public.set_updated_at();
+drop trigger if exists bugs_updated on public.bugs;
+create trigger bugs_updated before update on public.bugs for each row execute function public.set_updated_at();
+drop trigger if exists drafts_updated on public.drafts;
+create trigger drafts_updated before update on public.drafts for each row execute function public.set_updated_at();
+
+create or replace function public.my_store_id() returns uuid language sql stable security definer set search_path=public as $$
+  select store_id from public.profiles where id=auth.uid()
+$$;
+create or replace function public.is_superadmin() returns boolean language sql stable security definer set search_path=public as $$
+  select exists(select 1 from public.profiles where id=auth.uid() and role='superadmin' and status='active')
+$$;
+create or replace function public.is_store_admin(target_store uuid) returns boolean language sql stable security definer set search_path=public as $$
+  select exists(select 1 from public.profiles where id=auth.uid() and role='admin' and status='active' and store_id=target_store)
+$$;
+
+-- Allows a newly authenticated staff user to resolve an existing store by exact name without exposing all store data.
+create or replace function public.find_store_for_registration(p_store_name text)
+returns table(id uuid, store_name text) language sql security definer set search_path=public as $$
+  select s.id,s.store_name from public.pharmacy_stores s
+  where lower(trim(s.store_name))=lower(trim(p_store_name))
+  order by s.created_at asc limit 1
+$$;
+grant execute on function public.find_store_for_registration(text) to anon, authenticated;
+
+-- Atomic POS transaction: creates the sale, checks every stock quantity, deducts stock and creates sale items in one transaction.
+create or replace function public.complete_sale(
+  p_store_id uuid,p_invoice_number text,p_customer_name text,p_customer_phone text,p_payment_mode public.payment_mode,
+  p_subtotal numeric,p_discount numeric,p_cgst numeric,p_sgst numeric,p_gst_total numeric,p_total numeric,p_items jsonb
+) returns public.sales language plpgsql security invoker set search_path=public as $$
+declare v_sale public.sales; v_item jsonb; v_stock integer;
+begin
+  if public.my_store_id()<>p_store_id and not public.is_superadmin() then raise exception 'Not authorized for this store'; end if;
+  insert into public.sales(store_id,invoice_number,customer_name,customer_phone,payment_mode,subtotal,discount,cgst,sgst,gst_total,total,created_by)
+  values(p_store_id,p_invoice_number,p_customer_name,p_customer_phone,p_payment_mode,p_subtotal,p_discount,p_cgst,p_sgst,p_gst_total,p_total,auth.uid()) returning * into v_sale;
+  for v_item in select * from jsonb_array_elements(p_items) loop
+    update public.inventory set quantity=quantity-(v_item->>'quantity')::integer,updated_at=now()
+    where id=(v_item->>'inventory_id')::uuid and store_id=p_store_id and quantity >= (v_item->>'quantity')::integer
+    returning quantity into v_stock;
+    if not found then raise exception 'Insufficient stock or stock changed for %',v_item->>'medicine_name'; end if;
+    insert into public.sale_items(sale_id,inventory_id,medicine_name,batch_number,quantity,unit_price,gst_percent,line_total)
+    values(v_sale.id,(v_item->>'inventory_id')::uuid,v_item->>'medicine_name',v_item->>'batch_number',(v_item->>'quantity')::integer,(v_item->>'unit_price')::numeric,(v_item->>'gst_percent')::numeric,(v_item->>'line_total')::numeric);
+  end loop;
+  return v_sale;
+end $$;
+
+-- Adds one strike and enforces the requested policy: strikes 1-2 temporary block, strike 3 permanent block.
+create or replace function public.add_violation(p_profile_id uuid,p_reason text)
+returns public.profiles language plpgsql security invoker set search_path=public as $$
+declare v_profile public.profiles; v_next integer; v_status public.account_status; v_action text;
+begin
+  select * into v_profile from public.profiles where id=p_profile_id for update;
+  if not found then raise exception 'Profile not found'; end if;
+  if not (public.is_superadmin() or public.is_store_admin(v_profile.store_id)) then raise exception 'Not authorized'; end if;
+  v_next:=coalesce(v_profile.violation_count,0)+1;
+  if v_next>=3 then v_status:='permanent_blocked'; v_action:='Permanent block';
+  else v_status:='temporary_blocked'; v_action:='Temporary block'; end if;
+  update public.profiles set violation_count=v_next,last_violation_reason=p_reason,blocked_at=now(),blocked_until=case when v_next<3 then now()+interval '7 days' else null end,status=v_status where id=p_profile_id returning * into v_profile;
+  insert into public.violations(profile_id,store_id,reported_by,reason,strike_number,action_taken) values(p_profile_id,v_profile.store_id,auth.uid(),p_reason,v_next,v_action);
+  return v_profile;
+end $$;
+
+create or replace function public.restore_profile(p_profile_id uuid,p_clear_strikes boolean default true)
+returns public.profiles language plpgsql security invoker set search_path=public as $$
+declare v_profile public.profiles;
+begin
+  select * into v_profile from public.profiles where id=p_profile_id for update;
+  if not found then raise exception 'Profile not found'; end if;
+  if not (public.is_superadmin() or public.is_store_admin(v_profile.store_id)) then raise exception 'Not authorized'; end if;
+  update public.profiles set status='active',violation_count=case when p_clear_strikes then 0 else violation_count end,last_violation_reason=case when p_clear_strikes then null else last_violation_reason end,blocked_at=null,blocked_until=null,approved_by=auth.uid(),approved_at=now() where id=p_profile_id returning * into v_profile;
+  return v_profile;
+end $$;
+
+grant execute on function public.complete_sale(uuid,text,text,text,public.payment_mode,numeric,numeric,numeric,numeric,numeric,numeric,jsonb) to authenticated;
+grant execute on function public.add_violation(uuid,text) to authenticated;
+grant execute on function public.restore_profile(uuid,boolean) to authenticated;
+
+alter table public.profiles enable row level security;
+alter table public.pharmacy_stores enable row level security;
+alter table public.inventory enable row level security;
+alter table public.purchases enable row level security;
+alter table public.purchase_items enable row level security;
+alter table public.sales enable row level security;
+alter table public.sale_items enable row level security;
+alter table public.bugs enable row level security;
+alter table public.violations enable row level security;
+alter table public.expenses enable row level security;
+alter table public.drafts enable row level security;
+
+drop policy if exists profiles_select on public.profiles;
+create policy profiles_select on public.profiles for select using(id=auth.uid() or public.is_superadmin() or store_id=public.my_store_id());
+drop policy if exists profiles_insert on public.profiles;
+create policy profiles_insert on public.profiles for insert with check(id=auth.uid());
+drop policy if exists profiles_update on public.profiles;
+create policy profiles_update on public.profiles for update using(id=auth.uid() or public.is_superadmin() or public.is_store_admin(store_id)) with check(id=auth.uid() or public.is_superadmin() or public.is_store_admin(store_id));
+
+drop policy if exists stores_select on public.pharmacy_stores;
+create policy stores_select on public.pharmacy_stores for select using(id=public.my_store_id() or public.is_superadmin());
+drop policy if exists stores_insert on public.pharmacy_stores;
+create policy stores_insert on public.pharmacy_stores for insert with check(created_by=auth.uid());
+drop policy if exists stores_update on public.pharmacy_stores;
+create policy stores_update on public.pharmacy_stores for update using(public.is_store_admin(id) or public.is_superadmin()) with check(public.is_store_admin(id) or public.is_superadmin());
+
+ drop policy if exists inventory_all on public.inventory;
+create policy inventory_all on public.inventory for all using(store_id=public.my_store_id() or public.is_superadmin()) with check(store_id=public.my_store_id() or public.is_superadmin());
+drop policy if exists purchases_all on public.purchases;
+create policy purchases_all on public.purchases for all using(store_id=public.my_store_id() or public.is_superadmin()) with check(store_id=public.my_store_id() or public.is_superadmin());
+drop policy if exists purchase_items_all on public.purchase_items;
+create policy purchase_items_all on public.purchase_items for all using(exists(select 1 from public.purchases p where p.id=purchase_id and (p.store_id=public.my_store_id() or public.is_superadmin()))) with check(exists(select 1 from public.purchases p where p.id=purchase_id and (p.store_id=public.my_store_id() or public.is_superadmin())));
+drop policy if exists sales_all on public.sales;
+create policy sales_all on public.sales for all using(store_id=public.my_store_id() or public.is_superadmin()) with check(store_id=public.my_store_id() or public.is_superadmin());
+drop policy if exists sale_items_all on public.sale_items;
+create policy sale_items_all on public.sale_items for all using(exists(select 1 from public.sales s where s.id=sale_id and (s.store_id=public.my_store_id() or public.is_superadmin()))) with check(exists(select 1 from public.sales s where s.id=sale_id and (s.store_id=public.my_store_id() or public.is_superadmin())));
+drop policy if exists bugs_all on public.bugs;
+create policy bugs_all on public.bugs for all using(reporter_id=auth.uid() or store_id=public.my_store_id() or public.is_superadmin()) with check(reporter_id=auth.uid() or store_id=public.my_store_id() or public.is_superadmin());
+drop policy if exists violations_select on public.violations;
+create policy violations_select on public.violations for select using(profile_id=auth.uid() or public.is_superadmin() or public.is_store_admin(store_id));
+drop policy if exists violations_insert on public.violations;
+create policy violations_insert on public.violations for insert with check(public.is_superadmin() or public.is_store_admin(store_id));
+drop policy if exists expenses_all on public.expenses;
+create policy expenses_all on public.expenses for all using(store_id=public.my_store_id() or public.is_superadmin()) with check(store_id=public.my_store_id() or public.is_superadmin());
+drop policy if exists drafts_all on public.drafts;
+create policy drafts_all on public.drafts for all using(created_by=auth.uid() or store_id=public.my_store_id() or public.is_superadmin()) with check(created_by=auth.uid() or store_id=public.my_store_id() or public.is_superadmin());
+
+insert into storage.buckets(id,name,public) values('licenses','licenses',false) on conflict(id) do nothing;
+insert into storage.buckets(id,name,public) values('bug-screenshots','bug-screenshots',false) on conflict(id) do nothing;
+drop policy if exists license_upload_own on storage.objects;
+create policy license_upload_own on storage.objects for insert to authenticated with check(bucket_id='licenses' and (storage.foldername(name))[1]=auth.uid()::text);
+drop policy if exists license_read_own on storage.objects;
+create policy license_read_own on storage.objects for select to authenticated using(bucket_id='licenses' and ((storage.foldername(name))[1]=auth.uid()::text or public.is_superadmin()));
+drop policy if exists bug_upload_own on storage.objects;
+create policy bug_upload_own on storage.objects for insert to authenticated with check(bucket_id='bug-screenshots' and (storage.foldername(name))[1]=auth.uid()::text);
+drop policy if exists bug_read_own on storage.objects;
+create policy bug_read_own on storage.objects for select to authenticated using(bucket_id='bug-screenshots' and ((storage.foldername(name))[1]=auth.uid()::text or public.is_superadmin()));
+
+-- Founder bootstrap: create the first founder user in Authentication manually, then insert its profile:
+-- insert into public.profiles(id,full_name,mobile,role,status) values('AUTH_USER_UUID','Founder','+91XXXXXXXXXX','superadmin','active');
+-- Never expose service_role in this file.
+-- END SQL SETUP
+-->
+
+<div id="appRoot"></div>
+<div id="toast" class="fixed top-4 right-4 z-[200] space-y-2"></div>
+
+<script>
+/* ========================= SUPABASE CONFIG ========================= */
+/* Put your project URL and publishable/anon key here. Do NOT put a service_role key. */
+const SUPABASE_URL = "https://xyzjqzyzzfeppdojatec.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
+/* ================================================================ */
+
+(function(){
+  "use strict";
+
+  const state={session:null,me:null,store:null,inventory:[],cart:[],currentTab:"home",ocrText:"",ocrRows:[],realtime:null,authMode:"login",draftId:null,pendingSignup:null,pendingEmail:null};
+  let sb=null;
+
+  const $=(s,r=document)=>r.querySelector(s);
+  const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
+  const esc=v=>String(v??"").replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const money=n=>new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:2}).format(Number(n)||0);
+  const today=()=>new Date().toISOString().slice(0,10);
+  const validDate=v=>/^\d{4}-\d{2}-\d{2}$/.test(String(v||""));
+  const normalizePhone=v=>{let x=String(v||"").replace(/[^\d+]/g,"");if(/^0\d{10}$/.test(x))x="+91"+x.slice(1);if(/^\d{10}$/.test(x))x="+91"+x;return x;};
+  const validConfig=()=>Boolean(SUPABASE_URL&&SUPABASE_ANON_KEY&&/^https:\/\/[\w.-]+\.supabase\.co\/?$/.test(SUPABASE_URL)&&!/(YOUR_|your_|placeholder)/i.test(SUPABASE_URL+SUPABASE_ANON_KEY));
+  const uuid=()=>{if(window.crypto&&typeof window.crypto.randomUUID==="function")return window.crypto.randomUUID();return Date.now()+"-"+Math.random().toString(16).slice(2);};
+
+  function toast(message,type="info"){
+    const wrap=$("#toast");if(!wrap)return;
+    const el=document.createElement("div");
+    el.className="max-w-sm px-4 py-3 rounded-xl shadow-xl text-sm font-semibold text-white "+(type==="error"?"bg-red-600":type==="success"?"bg-emerald-600":"bg-slate-900");
+    el.textContent=message;wrap.appendChild(el);setTimeout(()=>el.remove(),4200);
+  }
+  function busy(btn,on,label){if(!btn)return;btn.disabled=on;if(on){btn.dataset.oldText=btn.textContent;btn.textContent=label||"Working…";}else{btn.textContent=btn.dataset.oldText||btn.textContent;}}
+  function statusLabel(s){return ({active:"Active",pending_superadmin:"Pending Super-Admin Review",pending_store_admin:"Pending Store Admin Approval",rejected:"Rejected",temporary_blocked:"Temporarily Blocked",permanent_blocked:"Permanently Blocked"}[s]||s);}
+  function statusClass(s){return s==="active"?"bg-emerald-100 text-emerald-700":s==="temporary_blocked"||s==="permanent_blocked"?"bg-red-100 text-red-700":s==="rejected"?"bg-slate-200 text-slate-700":"bg-amber-100 text-amber-700";}
+  function icon(name,cls="w-5 h-5"){return `<i data-lucide="${esc(name)}" class="${cls}"></i>`;}
+  function icons(){if(window.lucide&&typeof window.lucide.createIcons==="function")window.lucide.createIcons();}
+
+  function renderConfigBanner(){
+    const root=$("#configBanner");if(!root)return;
+    if(validConfig()){root.classList.add("hide");return;}
+
+    /*
+      Production behavior:
+      - Normal visitors never see developer credentials, file paths or Supabase keys.
+      - A developer can append ?setup=1 to the local URL to see the setup instructions.
+      - The application remains completely safe when configuration is missing.
+    */
+    const setupMode=new URLSearchParams(window.location.search).get("setup")==="1";
+    if(!setupMode){
+      root.classList.add("hide");
+      return;
+    }
+    root.classList.remove("hide");
+    root.innerHTML=`<div class="setup-banner">
+      <div class="setup-icon">${icon("settings-2","w-6 h-6")}</div>
+      <div class="min-w-0 flex-1">
+        <div class="font-black text-slate-900">Developer setup required</div>
+        <p class="text-sm text-slate-600 mt-1">Add your Supabase project URL and publishable/anon key in the configuration section of <b>index.html</b>.</p>
+        <p class="text-xs text-slate-500 mt-2">This message is visible only when <code>?setup=1</code> is added to the local URL. End users will not see your credentials or developer instructions.</p>
+      </div>
+      <button type="button" id="hideSetupBanner" class="setup-close" aria-label="Close">${icon("x","w-5 h-5")}</button>
+    </div>`;
+    $("#hideSetupBanner")?.addEventListener("click",()=>root.classList.add("hide"));
+    icons();
+  }
+
+  function renderAuth(){
+    $("#appRoot").innerHTML=`
+      <div id="configBanner" class="max-w-7xl mx-auto px-4 pt-4"></div>
+      <div id="authScreen" class="min-h-[calc(100vh-1px)] grid lg:grid-cols-2">
+        <section class="hidden lg:flex bg-slate-950 text-white p-12 flex-col justify-between">
+          <div><div class="text-2xl font-black tracking-tight">MAAJ PHARMACY</div><p class="text-slate-400 mt-2">Pharmacy operations, inventory and billing.</p></div>
+          <div><p class="uppercase tracking-[.25em] text-teal-400 text-xs font-bold">Single-file pharmacy ERP</p><h1 class="text-5xl font-black leading-tight mt-4">Run the store.<br><span class="text-teal-400">Control the numbers.</span></h1><p class="text-slate-400 mt-6 max-w-xl">Supabase-backed accounts, approvals, inventory, purchase OCR, POS billing, audit records and bug reporting. No application data is stored in browser persistent storage.</p></div>
+          <div class="text-xs text-slate-500">RLS protected • Role based • Audit ready</div>
+        </section>
+        <section class="p-4 sm:p-8 flex items-center justify-center"><div class="w-full max-w-xl">
+          <div class="lg:hidden mb-6"><div class="text-2xl font-black">MAAJ PHARMACY</div><p class="text-slate-500">Pharmacy Management</p></div>
+          <div id="authCards"></div>
+        </div></section>
+      </div>`;
+    renderAuthCard();renderConfigBanner();
+  }
+
+  function renderAuthCard(){
+    const wrap=$("#authCards");
+    if(state.authMode==="signup"){
+      wrap.innerHTML=`<div class="bg-white rounded-3xl shadow-xl p-6 sm:p-8">
+        <div class="flex items-start justify-between gap-4">
+          <div><h2 class="text-2xl font-black">Create account</h2><p class="text-slate-500 mt-1">Email confirmation code is required. Phone is stored for your pharmacy profile only.</p></div>
+          <span class="px-2 py-1 rounded-full bg-teal-100 text-teal-700 text-xs font-bold">Signup</span>
+        </div>
+        <form id="signupForm" class="mt-6 space-y-3">
+          <div class="grid sm:grid-cols-2 gap-3">
+            <input name="store_name" required class="field" placeholder="Store Name">
+            <input name="owner_name" required class="field" placeholder="Owner Name">
+            <input name="pharmacist_name" required class="field" placeholder="Pharmacist Name">
+            <select name="role" id="signupRole" class="field"><option value="admin">Admin</option><option value="staff">Staff</option></select>
+            <input name="mobile" required inputmode="tel" class="field" placeholder="Mobile Number (+91XXXXXXXXXX)">
+            <input name="email" required type="email" class="field" placeholder="Email ID">
+            <input name="password" required minlength="8" type="password" class="field" placeholder="Password (8+ chars)">
+            <input name="confirm" required minlength="8" type="password" class="field" placeholder="Confirm Password">
+          </div>
+          <div id="licenseBox" class="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+            <div class="font-bold text-sm">Admin Drug License Verification</div>
+            <input name="license" id="licenseNumber" required class="field mt-2" placeholder="Drug License Number">
+            <input name="license_file" id="licenseFile" required type="file" accept="image/*,application/pdf" class="w-full mt-3 text-sm">
+            <p class="text-xs text-slate-500 mt-2">The file is uploaded to the private Supabase <b>licenses</b> bucket after email verification.</p>
+          </div>
+          <div id="staffBox" class="hide rounded-2xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">Staff must enter the exact existing Store Name. The account will remain locked until that store's Admin approves it.</div>
+          <button type="submit" class="primary-btn w-full">Create Account</button>
+        </form>
+        <button id="backLogin" class="secondary-btn w-full mt-3">Back to Sign In</button>
+      </div>`;
+      $("#signupRole").onchange=()=>toggleLicenseFields();
+      $("#signupForm").onsubmit=signup;
+    }else if(state.authMode==="emailVerify"){
+      wrap.innerHTML=`<div class="bg-white rounded-3xl shadow-xl p-6 sm:p-8">
+        <div class="w-12 h-12 rounded-2xl bg-teal-100 text-teal-700 flex items-center justify-center font-black text-xl">✉</div>
+        <h2 class="text-2xl font-black mt-4">Verify your email</h2>
+        <p class="text-slate-500 mt-1">We sent a 6-digit confirmation code to <b>${esc(state.pendingEmail||"your email")}</b>.</p>
+        <form id="emailVerifyForm" class="mt-6 space-y-3">
+          <input id="emailOtp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required class="field text-center text-2xl tracking-[.35em]" placeholder="000000">
+          <button type="submit" class="primary-btn w-full">Verify Email</button>
+        </form>
+        <button id="resendEmail" class="secondary-btn w-full mt-3">Resend Code</button>
+        <button id="backEmailLogin" class="w-full mt-3 text-sm font-bold text-slate-500 hover:text-teal-700">Back to Sign In</button>
+      </div>`;
+      $("#emailVerifyForm").onsubmit=verifyEmailCode;
+      $("#resendEmail").onclick=resendEmailCode;
+      $("#backEmailLogin").onclick=()=>{state.authMode="login";state.pendingEmail=null;state.pendingSignup=null;renderAuthCard();renderConfigBanner();};
+      setTimeout(()=>$("#emailOtp")?.focus(),50);
+    }else{
+      wrap.innerHTML=`<div class="bg-white rounded-3xl shadow-xl p-6 sm:p-8">
+        <h2 class="text-2xl font-black">Sign in</h2><p class="text-slate-500 mt-1">Use your registered email address and password.</p>
+        <form id="loginForm" class="mt-6 space-y-4">
+          <input name="email" required type="email" autocomplete="email" class="field" placeholder="Registered Email ID">
+          <input name="password" required type="password" autocomplete="current-password" class="field" placeholder="Password">
+          <button type="submit" class="primary-btn w-full">Sign In</button>
+        </form>
+        <button id="goSignup" class="secondary-btn w-full mt-3">Create Pharmacy Account</button>
+        <a href="superadmin.html" class="block text-center mt-5 text-sm font-bold text-slate-600 hover:text-teal-700">Founder / Super-Admin Portal →</a>
+      </div>`;
+      $("#loginForm").onsubmit=login;
+      $("#goSignup").onclick=()=>{state.authMode="signup";renderAuthCard();renderConfigBanner();};
+    }
+    const back=$("#backLogin");
+    if(back)back.onclick=()=>{state.authMode="login";state.pendingSignup=null;state.pendingEmail=null;renderAuthCard();renderConfigBanner();};
+    toggleLicenseFields();
+  }
+
+  function toggleLicenseFields(){
+    const role=$("#signupRole")?.value||"admin", admin=role==="admin";
+    $("#licenseBox")?.classList.toggle("hide",!admin);$("#staffBox")?.classList.toggle("hide",admin);
+    if($("#licenseNumber"))$("#licenseNumber").required=admin;
+    if($("#licenseFile"))$("#licenseFile").required=admin;
+  }
+
+  async function signup(e){
+    e.preventDefault();
+    if(!sb)return toast("Insert your Supabase URL and anon/publishable key first.","error");
+    const f=new FormData(e.target),role=String(f.get("role")||"admin"),phone=normalizePhone(f.get("mobile"));
+    const email=String(f.get("email")||"").trim().toLowerCase(),password=String(f.get("password")||"");
+    if(!/^\+\d{8,15}$/.test(phone))return toast("Enter a valid mobile number, for example +919876543210.","error");
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return toast("Enter a valid email address.","error");
+    if(password!==String(f.get("confirm")||""))return toast("Passwords do not match.","error");
+    if(role==="admin"&&(!f.get("license")||!f.get("license_file")))return toast("Admin registration requires drug-license number and file.","error");
+    const btn=e.target.querySelector("button[type=submit]");busy(btn,true,"Creating account…");
+    try{
+      const phoneCheck=await sb.from("profiles").select("id").eq("mobile",phone).maybeSingle();
+      if(phoneCheck.error)throw phoneCheck.error;
+      if(phoneCheck.data)throw new Error("This mobile number is already registered.");
+      const auth=await sb.auth.signUp({
+        email,password,
+        options:{data:{
+          full_name:String(f.get("owner_name")||"").trim(),mobile:phone,role,
+          store_name:String(f.get("store_name")||"").trim(),
+          owner_name:String(f.get("owner_name")||"").trim(),
+          pharmacist_name:String(f.get("pharmacist_name")||"").trim(),
+          license:String(f.get("license")||"").trim()
+        }}
+      });
+      if(auth.error)throw auth.error;
+      if(!auth.data?.user)throw new Error("Supabase did not create the account.");
+      state.pendingSignup={role,storeName:String(f.get("store_name")||"").trim(),ownerName:String(f.get("owner_name")||"").trim(),pharmacistName:String(f.get("pharmacist_name")||"").trim(),phone,email,license:String(f.get("license")||"").trim(),licenseFile:role==="admin"?f.get("license_file"):null,userId:auth.data.user.id};
+      state.pendingEmail=email;
+      if(auth.data.session){state.session=auth.data.session;await finishVerifiedRegistration(auth.data.user);return;}
+      state.authMode="emailVerify";renderAuthCard();renderConfigBanner();
+      toast("Verification code sent to your email. Check Inbox/Spam.","success");
+    }catch(err){
+      try{await sb.auth.signOut();}catch(_e){}
+      state.session=null;toast(err?.message||"Registration failed.","error");
+    }finally{busy(btn,false);}
+  }
+
+  async function verifyEmailCode(e){
+    e.preventDefault();
+    const email=state.pendingEmail,token=String($("#emailOtp")?.value||"").replace(/\D/g,"");
+    if(!email)return toast("Registration email is missing. Start again.","error");
+    if(token.length!==6)return toast("Enter the 6-digit email confirmation code.","error");
+    const btn=$("#emailVerifyForm button[type=submit]");busy(btn,true,"Verifying…");
+    try{
+      const r=await sb.auth.verifyOtp({email,token,type:"email"});
+      if(r.error)throw r.error;
+      if(!r.data?.user)throw new Error("Email verification failed.");
+      state.session=r.data.session;
+      await finishVerifiedRegistration(r.data.user);
+    }catch(err){toast(err?.message||"Invalid or expired confirmation code.","error");}
+    finally{busy(btn,false);}
+  }
+
+  async function resendEmailCode(){
+    if(!sb||!state.pendingEmail)return toast("Registration email is missing. Start again.","error");
+    const btn=$("#resendEmail");busy(btn,true,"Sending…");
+    try{
+      const r=await sb.auth.resend({type:"signup",email:state.pendingEmail});
+      if(r.error)throw r.error;
+      toast("A new confirmation code has been sent.","success");
+    }catch(err){toast(err?.message||"Could not resend the confirmation code.","error");}
+    finally{busy(btn,false);}
+  }
+
+  async function finishVerifiedRegistration(user){
+    const p=state.pendingSignup;
+    if(!p)throw new Error("Registration data expired. Please create the account again.");
+    if(!state.session?.user)throw new Error("Email verified, but no authenticated session was returned.");
+
+    const phoneCheck=await sb.from("profiles").select("id").eq("mobile",p.phone).neq("id",user.id).maybeSingle();
+    if(phoneCheck.error)throw phoneCheck.error;
+    if(phoneCheck.data){
+      await sb.auth.signOut();state.session=null;
+      throw new Error("This mobile number is already registered.");
+    }
+
+    let storeId=null;
+    if(p.role==="admin"){
+      const st=await sb.from("pharmacy_stores").insert({
+        store_name:p.storeName,owner_name:p.ownerName,pharmacist_name:p.pharmacistName,
+        drug_license_number:p.license,created_by:user.id,phone:p.phone,email:p.email
+      }).select().single();
+      if(st.error)throw st.error;
+      storeId=st.data.id;
+      if(p.licenseFile&&p.licenseFile.size){
+        const path=`${user.id}/${Date.now()}_${String(p.licenseFile.name).replace(/[^\w.-]/g,"_")}`;
+        const up=await sb.storage.from("licenses").upload(path,p.licenseFile,{upsert:false,contentType:p.licenseFile.type});
+        if(up.error)throw up.error;
+        const upStore=await sb.from("pharmacy_stores").update({drug_license_path:path}).eq("id",storeId);
+        if(upStore.error)throw upStore.error;
+      }
+    }else{
+      const sr=await sb.rpc("find_store_for_registration",{p_store_name:p.storeName});
+      if(sr.error)throw sr.error;
+      if(!sr.data?.length)throw new Error("Store not found. Staff must enter an existing pharmacy store name.");
+      storeId=sr.data[0].id;
+    }
+
+    const profile=await sb.from("profiles").insert({
+      id:user.id,store_id:storeId,store_name:p.storeName,owner_name:p.ownerName,
+      pharmacist_name:p.pharmacistName,full_name:p.ownerName,mobile:p.phone,email:p.email,
+      role:p.role,status:p.role==="admin"?"pending_superadmin":"pending_store_admin"
+    });
+    if(profile.error)throw profile.error;
+
+    await sb.auth.signOut();state.session=null;state.pendingSignup=null;state.pendingEmail=null;
+    state.authMode="login";renderAuthCard();renderConfigBanner();
+    toast(p.role==="admin"?"Email verified. Account is pending Super-Admin review.":"Email verified. Account is pending Store Admin approval.","success");
+  }
+
+  async function login(e){
+    e.preventDefault();
+    if(!sb)return toast("Insert your Supabase URL and anon/publishable key first.","error");
+    const f=new FormData(e.target),email=String(f.get("email")||"").trim().toLowerCase(),password=String(f.get("password")||"");
+    const btn=e.target.querySelector("button[type=submit]");busy(btn,true,"Signing in…");
+    try{
+      const r=await sb.auth.signInWithPassword({email,password});
+      if(r.error)throw r.error;
+      state.session=r.data.session;await loadIdentity();
+      if(!state.me)throw new Error("Profile record is missing. Complete email verification/registration again.");
+      if(state.me.status!=="active"){
+        await sb.auth.signOut();state.session=null;
+        const msg=state.me.status==="pending_superadmin"?"Account is pending Super-Admin review.":state.me.status==="pending_store_admin"?"Account is pending Store Admin approval.":state.me.status==="temporary_blocked"?"Account is temporarily blocked.":state.me.status==="permanent_blocked"?"Account is permanently revoked.":"Account access is not active.";
+        throw new Error(msg);
+      }
+      await startApp();
+    }catch(err){toast(err?.message||"Sign in failed.","error");}
+    finally{busy(btn,false);}
+  }
+
+  async function loadIdentity(){
+    if(!state.session?.user)return;
+    const p=await sb.from("profiles").select("*").eq("id",state.session.user.id).maybeSingle();
+    if(p.error)throw p.error;
+    state.me=p.data||null;
+    state.store=null;
+    if(state.me?.store_id){
+      const s=await sb.from("pharmacy_stores").select("*").eq("id",state.me.store_id).single();
+      if(s.error)throw s.error;
+      state.store=s.data;
+    }
+  }
+
+  async function boot(){
+    try{
+      renderAuth();
+      if(!validConfig())return;
+      if(!window.supabase||typeof window.supabase.createClient!=="function")throw new Error("Supabase CDN did not load. Check your internet connection.");
+      sb=window.supabase.createClient(SUPABASE_URL.trim(),SUPABASE_ANON_KEY.trim(),{auth:{persistSession:false,autoRefreshToken:true,detectSessionInUrl:true}});
+      const hash=new URLSearchParams(window.location.hash.replace(/^#/,""));
+      const authError=hash.get("error_description");
+      if(authError){
+        window.history.replaceState({},document.title,window.location.pathname+window.location.search);
+        toast(decodeURIComponent(authError),"error");
+      }
+      const g=await sb.auth.getSession();
+      if(g.error)throw g.error;
+      if(g.data?.session){
+        state.session=g.data.session;
+        await loadIdentity();
+        if(state.me?.status==="active")await startApp();
+        else if(state.me){
+          await sb.auth.signOut();state.session=null;toast(statusLabel(state.me.status),"info");
+        }else{
+          await sb.auth.signOut();state.session=null;
+          toast("Email verified. Please complete registration again if the signup page was closed.","info");
+        }
+      }
+    }catch(err){
+      console.error(err);renderAuth();renderConfigBanner();toast(err?.message||"Application initialization failed.","error");
+    }
+  }
+
+  async function startApp(){renderApp();await loadData();subscribeRealtime();}
+
+  function renderApp(){
+    $("#appRoot").innerHTML=`<div class="min-h-screen pb-20 md:pb-0"><header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b"><div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-3"><div><div class="font-black text-lg">MAAJ PHARMACY</div><div class="text-xs text-slate-500">${esc(state.store?.store_name||state.me?.store_name||"Store")} • ${esc(state.me?.role||"")}</div></div><div class="flex items-center gap-2"><span class="px-2.5 py-1 rounded-full text-xs font-bold ${statusClass(state.me.status)}">${esc(statusLabel(state.me.status))}</span><button id="logout" class="p-2 border rounded-xl hover:bg-slate-50" title="Logout">${icon("log-out")}</button></div></div></header><main class="max-w-7xl mx-auto px-4 py-5"><div id="page"></div></main><nav class="fixed bottom-0 left-0 right-0 z-40 bg-white border-t md:static md:border-t-0 md:mt-8"><div class="max-w-7xl mx-auto grid grid-cols-5">${[["home","Home","house"],["sale","Sale","receipt"],["inventory","Inventory","boxes"],["purchase","Purchase","scan-line"],["account","Account","user-round"]].map(x=>`<button data-tab="${x[0]}" class="nav-btn py-3 text-xs font-bold flex flex-col items-center gap-1 text-slate-500 ${state.currentTab===x[0]?"nav-active":""}">${icon(x[2],"w-5 h-5")}${x[1]}</button>`).join("")}</div></nav><button id="bugBtn" class="fixed right-4 bottom-24 md:bottom-6 z-50 bg-red-600 hover:bg-red-700 text-white rounded-full w-14 h-14 shadow-xl font-black">BUG</button></div><div id="modal"></div><div id="bugDrawer" class="fixed inset-y-0 right-0 w-full sm:w-[430px] bg-white shadow-2xl z-[100] drawer translate-x-full"><div class="p-5 border-b flex items-center justify-between"><h2 class="font-black">Report a bug</h2><button id="closeBug" class="p-2 border rounded-lg">✕</button></div><form id="bugForm" class="p-5 space-y-3"><input name="title" required class="field" placeholder="Short title"><textarea name="description" required rows="6" class="field" placeholder="What happened? What did you expect?"></textarea><input name="screenshot" type="file" accept="image/*" class="w-full text-sm"><p class="text-xs text-slate-500">Attach a screenshot if available. Browser URL, user agent, online status and timestamp are logged automatically.</p><button class="danger-btn w-full">Submit Bug Report</button></form></div><div id="printInvoice" class="hide print-area"></div>`;
+    $$(".nav-btn").forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.tab;renderPage();});
+    $("#logout").onclick=logout;$("#bugBtn").onclick=()=>$("#bugDrawer").classList.remove("translate-x-full");$("#closeBug").onclick=()=>$("#bugDrawer").classList.add("translate-x-full");$("#bugForm").onsubmit=submitBug;
+    renderPage();icons();
+  }
+
+  async function logout(){if(sb)await sb.auth.signOut();if(state.realtime)sb.removeChannel(state.realtime);state.session=null;state.me=null;state.store=null;state.inventory=[];state.cart=[];state.realtime=null;state.authMode="login";renderAuth();renderConfigBanner();}
+  async function loadData(){await loadInventory();}
+  async function loadInventory(){if(!state.store)return;const r=await sb.from("inventory").select("*").eq("store_id",state.store.id).order("medicine_name",{ascending:true});if(r.error)throw r.error;state.inventory=r.data||[];}
+  function subscribeRealtime(){if(!state.store||!sb)return;if(state.realtime)sb.removeChannel(state.realtime);state.realtime=sb.channel("store-"+state.store.id).on("postgres_changes",{event:"*",schema:"public",table:"inventory",filter:"store_id=eq."+state.store.id},async()=>{await loadInventory();renderPage();}).on("postgres_changes",{event:"*",schema:"public",table:"sales",filter:"store_id=eq."+state.store.id},()=>{if(state.currentTab==="home")loadFinance(0);}).subscribe();}
+
+  function renderPage(){
+    if(!$("#page"))return;
+    const views={home:homeView,sale:saleView,inventory:inventoryView,purchase:purchaseView,account:accountView};
+    $("#page").innerHTML=`<div class="tab-in">${views[state.currentTab]()}</div>`;bindPage();icons();
+  }
+
+  function homeView(){
+    const low=state.inventory.filter(x=>Number(x.quantity)<=Number(x.low_stock_threshold)).length;
+    const exp=state.inventory.filter(x=>{const d=(new Date(x.expiry_date)-new Date())/86400000;return d>=0&&d<=90;}).length;
+    const expired=state.inventory.filter(x=>new Date(x.expiry_date)<new Date(today()+"T00:00:00")).length;
+    return `<div class="space-y-5"><div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3"><div><div class="text-xs uppercase tracking-wider text-teal-700 font-bold">${esc(state.me.role)}</div><h1 class="text-2xl font-black mt-1">Good ${new Date().getHours()<12?"morning":new Date().getHours()<18?"afternoon":"evening"}, ${esc(state.me.full_name||state.me.owner_name||"")}</h1><p class="text-slate-500">${new Date().toLocaleDateString("en-IN",{dateStyle:"full"})}</p></div><button data-quick-sale class="primary-btn">+ New Sale</button></div>
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">${metric("Expected Cash in Hand","—","wallet-cards","text-teal-700")} ${metric("Total Revenue","—","indian-rupee","text-blue-700")} ${metric("Low Stock",low,"triangle-alert",low?"text-red-600":"text-emerald-700")} ${metric("Expiring ≤90 Days",exp,"calendar-clock",exp?"text-amber-600":"text-emerald-700")}</div>
+      <div class="grid lg:grid-cols-2 gap-5"><section class="bg-white rounded-3xl p-5 shadow-sm"><div class="flex items-center justify-between"><div><h2 class="font-black">Stock Health</h2><p class="text-xs text-slate-500">${expired} expired batch(es)</p></div><button data-open-inv class="text-sm text-teal-700 font-bold">Open Inventory</button></div><div class="mt-4 space-y-3">${state.inventory.slice(0,7).map(x=>`<div class="flex items-center justify-between gap-3 border-b last:border-0 pb-3"><div class="min-w-0"><div class="font-semibold truncate">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500">Batch ${esc(x.batch_number)} • Exp ${esc(x.expiry_date)}</div></div><span class="font-black ${Number(x.quantity)<=Number(x.low_stock_threshold)?"text-red-600":"text-emerald-700"}">${Number(x.quantity)}</span></div>`).join("")||`<p class="text-slate-500">No inventory yet. Add a batch or save a purchase.</p>`}</div></section>
+      <section class="bg-slate-950 text-white rounded-3xl p-5"><div class="flex items-center justify-between"><div><h2 class="font-black text-xl">Cash & Financial Dashboard</h2><p class="text-slate-400 text-sm mt-1">Live calculations from Supabase sales and expenses.</p></div>${icon("chart-no-axes-combined","w-7 h-7 text-teal-400")}</div><div class="flex gap-2 mt-5">${["Today","Last 7 Days","Last 30 Days"].map((x,i)=>`<button data-fin="${i}" class="px-3 py-2 rounded-xl text-sm font-bold ${i===0?"bg-white text-slate-950":"bg-white/10"}">${x}</button>`).join("")}</div><div id="finance" class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-5"></div></section></div></div>`;
+  }
+  function metric(a,b,ico,cls){return `<div class="glass rounded-2xl p-4 shadow-sm">${icon(ico,"w-5 h-5 "+cls)}<div class="text-xs text-slate-500 mt-3">${a}</div><div class="text-xl font-black mt-1">${b}</div></div>`;}
+
+  function saleView(){return `<div class="space-y-5"><div class="flex flex-col sm:flex-row justify-between gap-3"><div><h1 class="text-2xl font-black">POS Sale</h1><p class="text-slate-500">Atomic stock deduction with CGST/SGST.</p></div><div class="flex gap-2"><button data-load-drafts class="secondary-btn">Drafts</button><button data-clear-cart class="secondary-btn">Clear</button></div></div><div class="grid lg:grid-cols-[1fr_410px] gap-5"><section class="bg-white rounded-3xl p-5"><input id="saleSearch" class="field" placeholder="Search medicine, generic name or batch"><div id="saleProducts" class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4"></div></section><section class="bg-white rounded-3xl p-5"><div class="flex items-center justify-between"><h2 class="font-black">Bill</h2><span id="cartCount" class="text-xs bg-slate-100 px-2 py-1 rounded-full">0 items</span></div><div id="cart" class="mt-4 space-y-2 max-h-72 overflow-auto scrollbar"></div><div class="border-t mt-4 pt-4 space-y-2 text-sm"><div class="flex justify-between"><span>Subtotal</span><b id="subtotal">₹0</b></div><div class="flex justify-between items-center"><span>Discount</span><input id="discount" type="number" min="0" step="0.01" value="0" class="w-28 border rounded-lg px-2 py-1 text-right"></div><div class="flex justify-between"><span>CGST</span><b id="cgst">₹0</b></div><div class="flex justify-between"><span>SGST</span><b id="sgst">₹0</b></div><div class="flex justify-between text-lg pt-2 border-t"><span class="font-black">Total</span><b id="grand">₹0</b></div></div><div class="mt-4 space-y-2"><input id="customerName" class="field" placeholder="Customer name (optional)"><input id="customerPhone" class="field" placeholder="Customer mobile (optional)"><select id="paymentMode" class="field"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="credit">Credit</option></select><button id="completeSale" class="primary-btn w-full">Complete Sale & Print</button><button id="saveDraft" class="secondary-btn w-full">Save Draft to Supabase</button></div></section></div></div>`;}
+  function renderProducts(q=""){const el=$("#saleProducts");if(!el)return;const s=String(q).toLowerCase();const list=state.inventory.filter(x=>Number(x.quantity)>0&&(x.medicine_name+" "+(x.generic_name||"")+" "+x.batch_number).toLowerCase().includes(s));el.innerHTML=list.map(x=>`<button data-add="${x.id}" class="text-left border rounded-2xl p-4 hover:border-teal-500 hover:shadow-sm"><div class="font-bold">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500 mt-1">Batch ${esc(x.batch_number)} • Stock ${Number(x.quantity)}</div><div class="text-xs mt-2">GST ${Number(x.gst_percent||0)}%</div><div class="font-black mt-2">${money(x.selling_rate||x.mrp)}</div></button>`).join("")||`<div class="col-span-full text-center py-10 text-slate-500">No matching stock.</div>`;}
+  function cartTotals(){const sub=state.cart.reduce((s,x)=>s+Number(x.quantity)*Number(x.unit_price),0);const disc=Math.min(Math.max(0,Number($("#discount")?.value||0)),sub);const gst=state.cart.reduce((s,x)=>s+Number(x.quantity)*Number(x.unit_price)*(Number(x.gst_percent||0)/100),0);return{sub,disc,taxable:Math.max(0,sub-disc),gst,total:Math.max(0,sub-disc+gst)};}
+  function renderCart(){const el=$("#cart");if(!el)return;el.innerHTML=state.cart.map((x,i)=>`<div class="border rounded-xl p-3"><div class="flex justify-between gap-2"><div class="min-w-0"><div class="font-semibold truncate">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500">${esc(x.batch_number)} • ${money(x.unit_price)}</div></div><button data-remove-cart="${i}" class="text-red-600 font-bold">✕</button></div><div class="flex items-center gap-3 mt-2"><button data-dec="${i}" class="w-8 h-8 border rounded-lg">−</button><span class="font-bold">${x.quantity}</span><button data-inc="${i}" class="w-8 h-8 border rounded-lg">+</button></div></div>`).join("")||`<p class="text-sm text-slate-500 py-6 text-center">Add stock to start billing.</p>`;const t=cartTotals();$("#subtotal").textContent=money(t.sub);$("#cgst").textContent=money(t.gst/2);$("#sgst").textContent=money(t.gst/2);$("#grand").textContent=money(t.total);$("#cartCount").textContent=state.cart.reduce((s,x)=>s+x.quantity,0)+" units";}
+
+  function inventoryView(){return `<div class="space-y-5"><div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3"><div><h1 class="text-2xl font-black">Inventory</h1><p class="text-slate-500">Batch-wise live stock, expiry and pricing.</p></div><button data-add-inventory class="primary-btn">+ Add Batch</button></div><div class="bg-white rounded-3xl p-5"><input id="invSearch" class="field" placeholder="Search medicine, batch, category or supplier"><div class="overflow-auto mt-4 scrollbar"><table class="w-full text-sm min-w-[760px]"><thead><tr class="text-left border-b text-slate-500"><th class="py-3">Medicine</th><th>Batch</th><th>Expiry</th><th>Stock</th><th>MRP</th><th>Sell</th><th>GST</th><th></th></tr></thead><tbody id="invRows"></tbody></table></div></div></div>`;}
+  function renderInventoryRows(q=""){const el=$("#invRows");if(!el)return;const s=String(q).toLowerCase();const list=state.inventory.filter(x=>(x.medicine_name+" "+x.batch_number+" "+(x.category||"")+" "+(x.supplier_name||"")).toLowerCase().includes(s));el.innerHTML=list.map(x=>{const d=Math.ceil((new Date(x.expiry_date)-new Date(today()+"T00:00:00"))/86400000);const expired=d<0;return `<tr class="border-b"><td class="py-3 font-semibold">${esc(x.medicine_name)}<div class="text-xs text-slate-500">${esc(x.category||"")}</div></td><td>${esc(x.batch_number)}</td><td class="${expired?"text-red-600 font-bold":d<=90?"text-amber-600 font-bold":""}">${esc(x.expiry_date)}</td><td class="${Number(x.quantity)<=Number(x.low_stock_threshold)?"text-red-600 font-black":""}">${Number(x.quantity)}</td><td>${money(x.mrp)}</td><td>${money(x.selling_rate)}</td><td>${Number(x.gst_percent)}%</td><td><button data-edit-inv="${x.id}" class="text-teal-700 font-bold">Edit</button></td></tr>`;}).join("")||`<tr><td colspan="8" class="py-8 text-center text-slate-500">No stock found.</td></tr>`;}
+  function field(name,label,value,type="text",required=false){return `<label class="block text-sm font-semibold">${label}<input name="${name}" type="${type}" ${required?"required":""} value="${esc(value??"")}" class="field mt-1"></label>`;}
+  function inventoryModal(id=null){const x=id?state.inventory.find(i=>i.id===id):{medicine_name:"",generic_name:"",category:"",batch_number:"",expiry_date:today(),mrp:0,purchase_rate:0,selling_rate:0,gst_percent:0,quantity:0,low_stock_threshold:10,supplier_name:"",barcode:""};$("#modal").innerHTML=`<div class="fixed inset-0 z-[120] bg-slate-950/50 p-4 flex items-center justify-center"><form id="invForm" class="bg-white rounded-3xl p-6 w-full max-w-3xl max-h-[90vh] overflow-auto"><div class="flex items-center justify-between"><div><h2 class="text-xl font-black">${id?"Edit":"Add"} Inventory Batch</h2><p class="text-sm text-slate-500">All values are saved directly to Supabase.</p></div><button type="button" data-close-modal class="p-2 border rounded-xl">✕</button></div><div class="grid sm:grid-cols-2 gap-3 mt-5">${field("medicine_name","Medicine Name",x.medicine_name,"text",true)}${field("generic_name","Generic Name",x.generic_name)}${field("category","Category",x.category)}${field("batch_number","Batch Number",x.batch_number,"text",true)}${field("expiry_date","Expiry Date",x.expiry_date,"date",true)}${field("mrp","MRP",x.mrp,"number",true)}${field("purchase_rate","Purchase Rate",x.purchase_rate,"number",true)}${field("selling_rate","Selling Rate",x.selling_rate,"number",true)}${field("gst_percent","GST %",x.gst_percent,"number",true)}${field("quantity","Quantity",x.quantity,"number",true)}${field("low_stock_threshold","Low Stock Threshold",x.low_stock_threshold,"number",true)}${field("supplier_name","Supplier",x.supplier_name)}${field("barcode","Barcode",x.barcode)}</div><button class="primary-btn w-full mt-5">Save Batch</button></form></div>`;$("[data-close-modal]").onclick=()=>$("#modal").innerHTML="";$("#invForm").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target),row=Object.fromEntries(f.entries());["mrp","purchase_rate","selling_rate","gst_percent","quantity","low_stock_threshold"].forEach(k=>row[k]=Number(row[k]||0));row.store_id=state.store.id;if(!id)row.created_by=state.me.id;const btn=e.target.querySelector("button.primary-btn");busy(btn,true,"Saving…");try{const r=id?await sb.from("inventory").update(row).eq("id",id).eq("store_id",state.store.id):await sb.from("inventory").insert(row);if(r.error)throw r.error;await loadInventory();$("#modal").innerHTML="";renderPage();toast("Inventory saved.","success");}catch(err){toast(err?.message||"Could not save inventory.","error");}finally{busy(btn,false);}};}
+
+  function purchaseView(){return `<div class="space-y-5"><div><h1 class="text-2xl font-black">Purchase & OCR</h1><p class="text-slate-500">Upload/capture a purchase bill, review OCR results and save stock.</p></div><div class="grid lg:grid-cols-2 gap-5"><section class="bg-white rounded-3xl p-5"><input id="billFile" type="file" accept="image/*" capture="environment" class="w-full border rounded-xl p-3"><button id="runOCR" class="primary-btn w-full mt-3">${icon("scan-line","w-5 h-5 inline-block mr-2") }Scan Purchase Bill</button><div id="ocrProgress" class="text-sm text-slate-500 mt-3">OCR is performed in the browser with Tesseract.js.</div><textarea id="ocrText" rows="12" class="field mt-3" placeholder="OCR text appears here. You can edit it and the table will be re-parsed."></textarea></section><section class="bg-white rounded-3xl p-5"><div class="flex items-center justify-between gap-2"><div><h2 class="font-black">Editable extracted rows</h2><p class="text-xs text-slate-500">Verify every field before posting stock.</p></div><button id="addOcrRow" class="secondary-btn">+ Row</button></div><div class="overflow-auto scrollbar mt-3"><table class="w-full text-xs min-w-[900px]"><thead><tr class="border-b"><th>Medicine</th><th>Batch</th><th>Expiry</th><th>MRP</th><th>Rate</th><th>Taxable</th><th>GST%</th><th>Qty</th><th></th></tr></thead><tbody id="ocrRows"></tbody></table></div><button id="savePurchase" class="primary-btn w-full mt-4">Save Purchase & Update Stock</button></section></div></div>`;}
+  function bindPurchase(){let file=null;$("#billFile").onchange=e=>file=e.target.files[0]||null;$("#runOCR").onclick=async()=>{if(!file)return toast("Choose a purchase bill image first.","error");if(!window.Tesseract)return toast("Tesseract.js did not load.","error");$("#ocrProgress").textContent="Starting OCR…";try{const r=await window.Tesseract.recognize(file,"eng",{logger:m=>{if(m.status)$("#ocrProgress").textContent=m.status+" "+Math.round((m.progress||0)*100)+"%";}});state.ocrText=r.data.text||"";$("#ocrText").value=state.ocrText;state.ocrRows=parseBill(state.ocrText);renderOcrRows();$("#ocrProgress").textContent="OCR complete. Review all extracted values.";}catch(err){toast(err?.message||"OCR failed.","error");}};$("#ocrText").oninput=e=>{state.ocrText=e.target.value;state.ocrRows=parseBill(state.ocrText);renderOcrRows();};$("#addOcrRow").onclick=()=>{state.ocrRows.push({medicine_name:"",batch_number:"",expiry_date:today(),mrp:0,purchase_rate:0,taxable_amount:0,gst_percent:0,quantity:1});renderOcrRows();};$("#savePurchase").onclick=savePurchase;renderOcrRows();}
+  function parseBill(text){const lines=String(text||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean),rows=[];for(const line of lines){const batch=(line.match(/\b(?:BATCH|B\.?\s*NO\.?|LOT)\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{2,})/i)||[])[1]||"";const ex=(line.match(/\b(0?[1-9]|1[0-2])[\/. -](20\d{2})\b/)||[]);const expiry=ex?`${ex[2]}-${String(ex[1]).padStart(2,"0")}-01`:"";const gstm=(line.match(/(?:GST|G\.S\.T)\s*[:@-]?\s*(\d+(?:\.\d+)?)\s*%?/i)||[])[1];const qtym=(line.match(/(?:QTY|QTY\.?|QUANTITY)\s*[:@-]?\s*(\d+)/i)||[])[1];const mrpm=(line.match(/(?:MRP)\s*[:@-]?\s*(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/i)||[])[1];const ratem=(line.match(/(?:RATE|PTR|P\.R\.)\s*[:@-]?\s*(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/i)||[])[1];const nums=[...line.matchAll(/(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/g)].map(m=>Number(m[1]));if(batch||expiry||gstm||qtym||mrpm||ratem||nums.length>=2){let name=line.replace(/(?:BATCH|B\.?\s*NO\.?|LOT).*$/i,"").replace(/\s{2,}/g," ").trim();name=name.replace(/^\d+[.)\-\s]+/,"").slice(0,100);const mrp=Number(mrpm||nums[0]||0),rate=Number(ratem||nums[1]||0),qty=Math.max(1,Number(qtym||nums[3]||1));rows.push({medicine_name:name,batch_number:batch,expiry_date:expiry||today(),mrp,purchase_rate:rate,taxable_amount:rate*qty,gst_percent:Number(gstm||0),quantity:Math.round(qty)});}}return rows.slice(0,100);}
+  function renderOcrRows(){const b=$("#ocrRows");if(!b)return;b.innerHTML=state.ocrRows.map((x,i)=>`<tr class="border-b"><td class="py-2"><input data-ocr="${i}:medicine_name" value="${esc(x.medicine_name)}" class="w-40 border rounded px-1 py-1"></td><td><input data-ocr="${i}:batch_number" value="${esc(x.batch_number)}" class="w-24 border rounded px-1 py-1"></td><td><input type="date" data-ocr="${i}:expiry_date" value="${esc(validDate(x.expiry_date)?x.expiry_date:today())}" class="w-32 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:mrp" value="${Number(x.mrp||0)}" class="w-20 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:purchase_rate" value="${Number(x.purchase_rate||0)}" class="w-20 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:taxable_amount" value="${Number(x.taxable_amount||0)}" class="w-24 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:gst_percent" value="${Number(x.gst_percent||0)}" class="w-16 border rounded px-1 py-1"></td><td><input type="number" min="1" data-ocr="${i}:quantity" value="${Number(x.quantity||1)}" class="w-16 border rounded px-1 py-1"></td><td><button data-del-ocr="${i}" class="text-red-600 font-bold">✕</button></td></tr>`).join("")||`<tr><td colspan="9" class="py-8 text-center text-slate-500">No extracted rows.</td></tr>`;$$('[data-ocr]').forEach(el=>el.oninput=e=>{const [i,k]=el.dataset.ocr.split(":");state.ocrRows[Number(i)][k]=e.target.value;});$$('[data-del-ocr]').forEach(b=>b.onclick=()=>{state.ocrRows.splice(Number(b.dataset.delOcr),1);renderOcrRows();});}
+  async function savePurchase(){if(!state.ocrRows.length)return toast("No rows to save.","error");const valid=state.ocrRows.filter(x=>String(x.medicine_name).trim()&&String(x.batch_number).trim()&&validDate(x.expiry_date)&&Number(x.quantity)>0);if(!valid.length)return toast("Each purchase row needs medicine, batch, valid expiry and quantity.","error");const taxable=valid.reduce((s,x)=>s+Number(x.taxable_amount||Number(x.purchase_rate||0)*Number(x.quantity||0)),0);const gst=valid.reduce((s,x)=>s+Number(x.purchase_rate||0)*Number(x.quantity||0)*Number(x.gst_percent||0)/100,0);try{const p=await sb.from("purchases").insert({store_id:state.store.id,supplier_name:"OCR BILL",invoice_date:today(),taxable_amount:taxable,gst_amount:gst,total_amount:taxable+gst,raw_ocr:state.ocrText,created_by:state.me.id}).select().single();if(p.error)throw p.error;for(const x of valid){const existing=state.inventory.find(i=>i.medicine_name.trim().toLowerCase()===String(x.medicine_name).trim().toLowerCase()&&i.batch_number.trim().toLowerCase()===String(x.batch_number).trim().toLowerCase());let inventoryId;if(existing){const upd=await sb.from("inventory").update({quantity:Number(existing.quantity)+Number(x.quantity),mrp:Number(x.mrp||existing.mrp),purchase_rate:Number(x.purchase_rate||existing.purchase_rate),gst_percent:Number(x.gst_percent||existing.gst_percent),expiry_date:x.expiry_date}).eq("id",existing.id).eq("store_id",state.store.id);if(upd.error)throw upd.error;inventoryId=existing.id;}else{const ins=await sb.from("inventory").insert({store_id:state.store.id,medicine_name:String(x.medicine_name).trim(),batch_number:String(x.batch_number).trim(),expiry_date:x.expiry_date,mrp:Number(x.mrp||0),purchase_rate:Number(x.purchase_rate||0),selling_rate:Number(x.mrp||0),gst_percent:Number(x.gst_percent||0),quantity:Number(x.quantity||0),low_stock_threshold:10,created_by:state.me.id}).select().single();if(ins.error)throw ins.error;inventoryId=ins.data.id;}const pi=await sb.from("purchase_items").insert({purchase_id:p.data.id,inventory_id:inventoryId,medicine_name:String(x.medicine_name).trim(),batch_number:String(x.batch_number).trim(),expiry_date:x.expiry_date,mrp:Number(x.mrp||0),purchase_rate:Number(x.purchase_rate||0),taxable_amount:Number(x.taxable_amount||0),gst_percent:Number(x.gst_percent||0),quantity:Number(x.quantity||0)});if(pi.error)throw pi.error;}await loadInventory();toast("Purchase saved and stock updated.","success");state.currentTab="inventory";renderPage();}catch(err){toast(err?.message||"Could not save purchase.","error");}}
+
+  function accountView(){return `<div class="space-y-5"><div><h1 class="text-2xl font-black">Account & Business Profile</h1><p class="text-slate-500">Store, license and team controls.</p></div><div class="grid lg:grid-cols-2 gap-5"><form id="storeForm" class="bg-white rounded-3xl p-5 space-y-3"><h2 class="font-black">Business Profile</h2>${field("store_name","Store Name",state.store.store_name,"text",true)}${field("owner_name","Owner Name",state.store.owner_name,"text",true)}${field("pharmacist_name","Pharmacist Name",state.store.pharmacist_name)}${field("drug_license_number","Drug License Number",state.store.drug_license_number)}${field("gstin","GSTIN",state.store.gstin)}${field("pan","PAN",state.store.pan)}<label class="block text-sm font-semibold">Address<textarea name="address" class="field mt-1" rows="4">${esc(state.store.address||"")}</textarea></label><button class="primary-btn">Save Business Profile</button></form><section class="bg-white rounded-3xl p-5"><div class="flex items-center justify-between"><div><h2 class="font-black">Team & Access</h2><p class="text-xs text-slate-500">Approve staff and restore blocked accounts.</p></div>${icon("users","w-6 h-6 text-teal-700")}</div><div id="team" class="mt-4"></div></section></div></div>`;}
+  async function loadTeam(){const el=$("#team");if(!el)return;const r=await sb.from("profiles").select("*").eq("store_id",state.store.id).order("created_at",{ascending:true});if(r.error){el.innerHTML=`<p class="text-red-600">${esc(r.error.message)}</p>`;return;}el.innerHTML=(r.data||[]).map(x=>{const can=state.me.role==="admin"&&x.id!==state.me.id;return `<div class="border rounded-2xl p-3 mb-2 flex items-start justify-between gap-3"><div class="min-w-0"><div class="font-bold">${esc(x.full_name||x.mobile)}</div><div class="text-xs text-slate-500 mt-1">${esc(x.role)} • ${esc(statusLabel(x.status))} • Strikes ${Number(x.violation_count||0)}</div>${x.last_violation_reason?`<div class="text-xs text-red-600 mt-1">${esc(x.last_violation_reason)}</div>`:""}</div>${can?`<div class="flex flex-wrap gap-2 justify-end">${x.status==="pending_store_admin"?`<button data-team-action="approve" data-id="${x.id}" class="text-emerald-700 font-bold text-sm">Approve</button>`:""}${x.status!=="permanent_blocked"?`<button data-team-action="strike" data-id="${x.id}" class="text-red-600 font-bold text-sm">Strike</button>`:""}${x.status.includes("blocked")?`<button data-team-action="restore" data-id="${x.id}" class="text-blue-700 font-bold text-sm">Unblock</button>`:""}</div>`:""}</div>`;}).join("")||`<p class="text-slate-500">No team members.</p>`;$$('[data-team-action]').forEach(b=>b.onclick=()=>teamAction(b.dataset.id,b.dataset.teamAction));}
+  async function teamAction(id,action){try{if(action==="approve"){const r=await sb.from("profiles").update({status:"active",approved_by:state.me.id,approved_at:new Date().toISOString()}).eq("id",id).eq("store_id",state.store.id);if(r.error)throw r.error;toast("Staff approved.","success");}else if(action==="strike"){const reason=prompt("Enter the violation reason:");if(!reason)return;const r=await sb.rpc("add_violation",{p_profile_id:id,p_reason:reason.trim()});if(r.error)throw r.error;toast("Strike added and account status updated.","success");}else{const r=await sb.rpc("restore_profile",{p_profile_id:id,p_clear_strikes:true});if(r.error)throw r.error;toast("Access restored and strikes cleared.","success");}await loadTeam();}catch(err){toast(err?.message||"Action failed.","error");}}
+  async function saveStore(e){e.preventDefault();const f=new FormData(e.target),row=Object.fromEntries(f.entries());const r=await sb.from("pharmacy_stores").update(row).eq("id",state.store.id);if(r.error)toast(r.error.message,"error");else{state.store={...state.store,...row};toast("Business profile updated.","success");}}
+
+  function bindPage(){
+    if(state.currentTab==="home"){$$('[data-fin]').forEach(b=>b.onclick=()=>{$$('[data-fin]').forEach(x=>x.className="px-3 py-2 rounded-xl text-sm font-bold bg-white/10");b.className="px-3 py-2 rounded-xl text-sm font-bold bg-white text-slate-950";loadFinance(Number(b.dataset.fin));});$("[data-quick-sale]").onclick=()=>{state.currentTab="sale";renderPage();};$("[data-open-inv]").onclick=()=>{state.currentTab="inventory";renderPage();};loadFinance(0);}
+    if(state.currentTab==="sale"){renderProducts();renderCart();$("#saleSearch").oninput=e=>renderProducts(e.target.value);$("#discount").oninput=renderCart;$("#completeSale").onclick=completeSale;$("#saveDraft").onclick=saveDraft;$("[data-clear-cart]").onclick=()=>{state.cart=[];renderCart();};$("[data-load-drafts]").onclick=loadDrafts;}
+    if(state.currentTab==="inventory"){renderInventoryRows();$("#invSearch").oninput=e=>renderInventoryRows(e.target.value);$("[data-add-inventory]").onclick=()=>inventoryModal();}
+    if(state.currentTab==="purchase")bindPurchase();
+    if(state.currentTab==="account"){$("#storeForm").onsubmit=saveStore;if(state.me.role==="admin")loadTeam();else $("#team").innerHTML=`<p class="text-slate-500 text-sm">Only the Store Admin can approve staff or clear strikes.</p>`;}
+  }
+
+  function addToCart(id){const x=state.inventory.find(i=>i.id===id);if(!x||Number(x.quantity)<=0)return;const ex=state.cart.find(c=>c.id===id);if(ex){if(ex.quantity<Number(x.quantity))ex.quantity++;else toast("Cannot exceed available stock.","error");}else state.cart.push({id:x.id,medicine_name:x.medicine_name,batch_number:x.batch_number,unit_price:Number(x.selling_rate||x.mrp),gst_percent:Number(x.gst_percent||0),quantity:1,stock:Number(x.quantity)});renderCart();}
+  async function completeSale(){if(!state.cart.length)return toast("Cart is empty.","error");const t=cartTotals();if(t.total<=0)return toast("Sale total must be greater than zero.","error");const btn=$("#completeSale");busy(btn,true,"Posting sale…");try{const invoice="INV-"+new Date().toISOString().replace(/\D/g,"").slice(0,14)+"-"+Math.floor(10+Math.random()*90);const r=await sb.rpc("complete_sale",{p_store_id:state.store.id,p_invoice_number:invoice,p_customer_name:$("#customerName").value.trim()||null,p_customer_phone:$("#customerPhone").value.trim()||null,p_payment_mode:$("#paymentMode").value,p_subtotal:t.sub,p_discount:t.disc,p_cgst:t.gst/2,p_sgst:t.gst/2,p_gst_total:t.gst,p_total:t.total,p_items:state.cart.map(x=>({inventory_id:x.id,medicine_name:x.medicine_name,batch_number:x.batch_number,quantity:x.quantity,unit_price:x.unit_price,gst_percent:x.gst_percent,line_total:x.quantity*x.unit_price}))});if(r.error)throw r.error;await loadInventory();printInvoice({...r.data,items:state.cart,discount:t.disc,cgst:t.gst/2,sgst:t.gst/2,total:t.total});state.cart=[];renderCart();toast("Sale completed and stock deducted.","success");}catch(err){toast(err?.message||"Sale failed.","error");}finally{busy(btn,false);}}
+  function printInvoice(s){$("#printInvoice").innerHTML=`<div style="padding:28px;font-family:Arial,sans-serif;max-width:900px;margin:auto"><h1 style="font-size:24px;font-weight:800">MAA JHARBANDHALIAN MEDICINE STORE</h1><p>${esc(state.store.address||"")}</p><p>License: ${esc(state.store.drug_license_number||"—")} ${state.store.gstin?" • GSTIN: "+esc(state.store.gstin):""}</p><hr><div style="display:flex;justify-content:space-between"><p><b>Invoice:</b> ${esc(s.invoice_number)}</p><p><b>Date:</b> ${new Date().toLocaleString("en-IN")}</p></div><p><b>Customer:</b> ${esc(s.customer_name||"Walk-in")} ${s.customer_phone?" • "+esc(s.customer_phone):""}</p><table style="width:100%;border-collapse:collapse;margin-top:20px"><thead><tr><th style="text-align:left;border-bottom:1px solid #aaa;padding:8px">Medicine</th><th style="border-bottom:1px solid #aaa">Batch</th><th style="border-bottom:1px solid #aaa">Qty</th><th style="border-bottom:1px solid #aaa">Rate</th><th style="border-bottom:1px solid #aaa">GST</th><th style="text-align:right;border-bottom:1px solid #aaa">Amount</th></tr></thead><tbody>${s.items.map(x=>`<tr><td style="padding:8px;border-bottom:1px solid #eee">${esc(x.medicine_name)}</td><td style="padding:8px;text-align:center">${esc(x.batch_number)}</td><td style="padding:8px;text-align:center">${x.quantity}</td><td style="padding:8px;text-align:right">${money(x.unit_price)}</td><td style="padding:8px;text-align:center">${Number(x.gst_percent||0)}%</td><td style="padding:8px;text-align:right">${money(Number(x.quantity)*Number(x.unit_price))}</td></tr>`).join("")}</tbody></table><div style="margin-top:20px;text-align:right"><p>Subtotal: ${money(s.subtotal)}</p><p>Discount: ${money(s.discount||0)}</p><p>CGST: ${money(s.cgst||0)}</p><p>SGST: ${money(s.sgst||0)}</p><h2 style="font-size:20px">Total: ${money(s.total)}</h2><p>Payment: ${esc(s.payment_mode)}</p></div><p style="margin-top:40px;text-align:center">Thank you for your purchase.</p></div>`;window.print();}
+  async function saveDraft(){if(!state.cart.length)return toast("Cart is empty.","error");const payload={cart:state.cart,discount:Number($("#discount").value||0),customerName:$("#customerName").value,customerPhone:$("#customerPhone").value,paymentMode:$("#paymentMode").value};const r=await sb.from("drafts").upsert({...(state.draftId?{id:state.draftId}:{}),store_id:state.store.id,created_by:state.me.id,payload});if(r.error)toast(r.error.message,"error");else toast("Draft saved to Supabase.","success");}
+  async function loadDrafts(){const r=await sb.from("drafts").select("*").eq("store_id",state.store.id).order("updated_at",{ascending:false}).limit(20);if(r.error)return toast(r.error.message,"error");if(!r.data?.length)return toast("No saved drafts.","info");$("#modal").innerHTML=`<div class="fixed inset-0 z-[120] bg-slate-950/50 p-4 flex items-center justify-center"><div class="bg-white rounded-3xl p-6 w-full max-w-2xl max-h-[85vh] overflow-auto"><div class="flex justify-between"><h2 class="text-xl font-black">Saved Drafts</h2><button data-close-modal class="p-2 border rounded-xl">✕</button></div><div class="space-y-2 mt-4">${r.data.map(d=>`<button data-draft="${d.id}" class="w-full text-left border rounded-xl p-3 hover:border-teal-500"><div class="font-bold">${new Date(d.updated_at).toLocaleString("en-IN")}</div><div class="text-xs text-slate-500">${esc(d.payload.customerName||"Walk-in")} • ${esc(d.payload.paymentMode||"cash")} • ${d.payload.cart?.length||0} lines</div></button>`).join("")}</div></div></div>`;$("[data-close-modal]").onclick=()=>$("#modal").innerHTML="";$$('[data-draft]').forEach(b=>b.onclick=()=>{const d=r.data.find(x=>x.id===b.dataset.draft);if(d){state.draftId=d.id;state.cart=d.payload.cart||[];$("#discount").value=d.payload.discount||0;$("#customerName").value=d.payload.customerName||"";$("#customerPhone").value=d.payload.customerPhone||"";$("#paymentMode").value=d.payload.paymentMode||"cash";$("#modal").innerHTML="";renderCart();toast("Draft loaded.","success");}});icons();}
+  async function loadFinance(period){const box=$("#finance");if(!box)return;const start=new Date();if(period===1)start.setDate(start.getDate()-6);if(period===2)start.setDate(start.getDate()-29);const [s,e]=await Promise.all([sb.from("sales").select("total,payment_mode,gst_total").eq("store_id",state.store.id).gte("created_at",start.toISOString()),sb.from("expenses").select("amount").eq("store_id",state.store.id).gte("created_at",start.toISOString())]);if(s.error||e.error)return;const sales=s.data||[],expenses=e.data||[];const revenue=sales.reduce((a,x)=>a+Number(x.total||0),0),cash=sales.filter(x=>x.payment_mode==="cash").reduce((a,x)=>a+Number(x.total||0),0),online=sales.filter(x=>x.payment_mode!=="cash").reduce((a,x)=>a+Number(x.total||0),0),gst=sales.reduce((a,x)=>a+Number(x.gst_total||0),0),ex=expenses.reduce((a,x)=>a+Number(x.amount||0),0);box.innerHTML=[["Total Revenue",money(revenue)],["Cash Sales (+)",money(cash)],["Expenses (-)",money(ex)],["Online Sales",money(online)],["Net Profit*",money(revenue-ex)],["GST Collected",money(gst)],["Avg Margin (%)","—"],["Sales Count",sales.length]].map(x=>`<div class="bg-white/10 rounded-xl p-3"><div class="text-xs text-slate-400">${x[0]}</div><div class="font-black mt-1">${x[1]}</div></div>`).join("")+`<div class="col-span-full text-xs text-slate-500">*Net Profit here is revenue minus recorded expenses; true gross profit requires cost-of-goods accounting.</div>`;}
+
+  async function submitBug(e){e.preventDefault();const f=new FormData(e.target);try{let path=null;const file=f.get("screenshot");if(file&&file.size){path=`${state.me.id}/${Date.now()}_${String(file.name).replace(/[^\w.-]/g,"_")}`;const u=await sb.storage.from("bug-screenshots").upload(path,file,{upsert:false,contentType:file.type});if(u.error)throw u.error;}const r=await sb.from("bugs").insert({reporter_id:state.me.id,store_id:state.store.id,title:String(f.get("title")).trim(),description:String(f.get("description")).trim(),screenshot_path:path,system_logs:{url:location.href,userAgent:navigator.userAgent,online:navigator.onLine,time:new Date().toISOString(),screen:{width:screen.width,height:screen.height},language:navigator.language}});if(r.error)throw r.error;e.target.reset();$("#bugDrawer").classList.add("translate-x-full");toast("Bug report submitted.","success");}catch(err){toast(err?.message||"Bug report failed.","error");}}
+
+  document.addEventListener("click",e=>{const add=e.target.closest("[data-add]");if(add){addToCart(add.dataset.add);return;}const rem=e.target.closest("[data-remove-cart]");if(rem){state.cart.splice(Number(rem.dataset.removeCart),1);renderCart();return;}const inc=e.target.closest("[data-inc]");if(inc){const x=state.cart[Number(inc.dataset.inc)];if(x&&x.quantity<x.stock)x.quantity++;else toast("Cannot exceed available stock.","error");renderCart();return;}const dec=e.target.closest("[data-dec]");if(dec){const i=Number(dec.dataset.dec),x=state.cart[i];if(x){x.quantity--;if(x.quantity<=0)state.cart.splice(i,1);}renderCart();return;}const edit=e.target.closest("[data-edit-inv]");if(edit){inventoryModal(edit.dataset.editInv);return;}});
+
+  const style=document.createElement("style");style.textContent=`
+    .field{width:100%;border:1px solid #cbd5e1;border-radius:.75rem;padding:.72rem 1rem;background:#fff;outline:none;transition:border-color .15s,box-shadow .15s,background .15s}.field:focus{border-color:#0f766e;box-shadow:0 0 0 3px rgba(15,118,110,.1)}
+    .primary-btn{display:inline-flex;align-items:center;justify-content:center;gap:.35rem;background:#0f766e;color:#fff;border-radius:.75rem;padding:.72rem 1rem;font-weight:800;transition:transform .15s,background .15s,box-shadow .15s}.primary-btn:hover{background:#115e59;transform:translateY(-1px);box-shadow:0 8px 18px rgba(15,118,110,.16)}.primary-btn:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
+    .secondary-btn{display:inline-flex;align-items:center;justify-content:center;gap:.35rem;border:1px solid #cbd5e1;background:#fff;border-radius:.75rem;padding:.65rem .9rem;font-weight:700;transition:background .15s,border-color .15s}.secondary-btn:hover{background:#f8fafc;border-color:#94a3b8}
+    .danger-btn{display:inline-flex;align-items:center;justify-content:center;background:#dc2626;color:#fff;border-radius:.75rem;padding:.72rem 1rem;font-weight:800}
+    .setup-banner{display:flex;align-items:flex-start;gap:12px;max-width:1040px;margin:14px auto 0;padding:14px 16px;border:1px solid #cbd5e1;background:rgba(255,255,255,.96);border-radius:16px;box-shadow:0 8px 24px rgba(15,23,42,.07)}
+    .setup-icon{width:40px;height:40px;display:grid;place-items:center;border-radius:12px;background:#ecfdf5;color:#0f766e;flex:none}.setup-close{display:grid;place-items:center;width:34px;height:34px;border:1px solid #e2e8f0;border-radius:10px;background:#fff;color:#64748b;flex:none}.setup-close:hover{background:#f8fafc;color:#0f172a}
+  `;document.head.appendChild(style);
+
+  document.addEventListener("DOMContentLoaded",boot);
+})();
+</script>
+</body>
+</html>
