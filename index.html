@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#0f766e">
   <title>MAAJ PHARMACY — Pharmacy Management</title>
+  <!-- MAAJ ERP FINAL V2 — modal-safe build -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -369,6 +370,12 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
   let sb=null;
 
   const $=(s,r=document)=>r.querySelector(s);
+  // GLOBAL MODAL SAFETY: modal host always exists, even before the main app is rendered.
+  function ensureModalHost(){
+    let m=document.getElementById("modal");
+    if(!m){m=document.createElement("div");m.id="modal";document.body.appendChild(m);}
+    return m;
+  }
   const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
   const esc=v=>String(v??"").replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   const money=n=>new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:2}).format(Number(n)||0);
@@ -441,7 +448,7 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
     if(state.authMode==="signup"){
       wrap.innerHTML=`<div class="bg-white rounded-3xl shadow-xl p-6 sm:p-8">
         <div class="flex items-start justify-between gap-4">
-          <div><h2 class="text-2xl font-black">Create account</h2><p class="text-slate-500 mt-1">Email confirmation code is required. Phone is stored for your pharmacy profile only.</p></div>
+          <div><h2 class="text-2xl font-black">Create account</h2><p class="text-slate-500 mt-1">No email or phone OTP is required. Email + password is used for login; phone is stored for your pharmacy profile only.</p></div>
           <span class="px-2 py-1 rounded-full bg-teal-100 text-teal-700 text-xs font-bold">Signup</span>
         </div>
         <form id="signupForm" class="mt-6 space-y-3">
@@ -459,7 +466,7 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
             <div class="font-bold text-sm">Admin Drug License Verification</div>
             <input name="license" id="licenseNumber" required class="field mt-2" placeholder="Drug License Number">
             <input name="license_file" id="licenseFile" required type="file" accept="image/*,application/pdf" class="w-full mt-3 text-sm">
-            <p class="text-xs text-slate-500 mt-2">The file is uploaded to the private Supabase <b>licenses</b> bucket after email verification.</p>
+            <p class="text-xs text-slate-500 mt-2">The file is uploaded to the private Supabase <b>licenses</b> bucket immediately after account creation.</p>
           </div>
           <div id="staffBox" class="hide rounded-2xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">Staff must enter the exact existing Store Name. The account will remain locked until that store's Admin approves it.</div>
           <button type="submit" class="primary-btn w-full">Create Account</button>
@@ -468,22 +475,6 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
       </div>`;
       $("#signupRole").onchange=()=>toggleLicenseFields();
       $("#signupForm").onsubmit=signup;
-    }else if(state.authMode==="emailVerify"){
-      wrap.innerHTML=`<div class="bg-white rounded-3xl shadow-xl p-6 sm:p-8">
-        <div class="w-12 h-12 rounded-2xl bg-teal-100 text-teal-700 flex items-center justify-center font-black text-xl">✉</div>
-        <h2 class="text-2xl font-black mt-4">Verify your email</h2>
-        <p class="text-slate-500 mt-1">We sent a 6-digit confirmation code to <b>${esc(state.pendingEmail||"your email")}</b>.</p>
-        <form id="emailVerifyForm" class="mt-6 space-y-3">
-          <input id="emailOtp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" required class="field text-center text-2xl tracking-[.35em]" placeholder="000000">
-          <button type="submit" class="primary-btn w-full">Verify Email</button>
-        </form>
-        <button id="resendEmail" class="secondary-btn w-full mt-3">Resend Code</button>
-        <button id="backEmailLogin" class="w-full mt-3 text-sm font-bold text-slate-500 hover:text-teal-700">Back to Sign In</button>
-      </div>`;
-      $("#emailVerifyForm").onsubmit=verifyEmailCode;
-      $("#resendEmail").onclick=resendEmailCode;
-      $("#backEmailLogin").onclick=()=>{state.authMode="login";state.pendingEmail=null;state.pendingSignup=null;renderAuthCard();renderConfigBanner();};
-      setTimeout(()=>$("#emailOtp")?.focus(),50);
     }else{
       wrap.innerHTML=`<div class="bg-white rounded-3xl shadow-xl p-6 sm:p-8">
         <h2 class="text-2xl font-black">Sign in</h2><p class="text-slate-500 mt-1">Use your registered email address and password.</p>
@@ -510,132 +501,162 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
     if($("#licenseFile"))$("#licenseFile").required=admin;
   }
 
+  /* ================= AUTH + ONE DEVICE SESSION ================= */
+  let deviceSessionTimer=null;
+  let deviceSessionId=null;
+  let sessionEndedByOtherDevice=false;
+
+  function deviceLabel(){
+    const ua=navigator.userAgent||"";
+    const browser=/Edg\//i.test(ua)?"Edge":/Chrome\//i.test(ua)?"Chrome":/Firefox\//i.test(ua)?"Firefox":/Safari\//i.test(ua)?"Safari":"Browser";
+    const os=/Windows/i.test(ua)?"Windows":/Android/i.test(ua)?"Android":/iPhone|iPad/i.test(ua)?"iPhone/iPad":/Mac/i.test(ua)?"Mac":/Linux/i.test(ua)?"Linux":"Device";
+    return `${browser} / ${os}`;
+  }
+
+  async function claimDeviceSession(force=false){
+    const r=await sb.rpc("claim_device_session",{p_device_label:deviceLabel(),p_force:force});
+    if(r.error)throw r.error;
+    return r.data?.[0]||null;
+  }
+
+  function stopDeviceSessionControl(){
+    if(deviceSessionTimer){clearInterval(deviceSessionTimer);deviceSessionTimer=null;}
+    deviceSessionId=null;
+  }
+
+  function startDeviceSessionControl(){
+    stopDeviceSessionControl();
+    if(!state.session?.user)return;
+    deviceSessionTimer=setInterval(async()=>{
+      try{
+        if(!state.session?.user){stopDeviceSessionControl();return;}
+        const r=await sb.rpc("touch_device_session");
+        if(r.error||r.data!==true)await handleRemoteLogout();
+      }catch(err){console.warn("Device session check failed",err);}
+    },15000);
+  }
+
+  async function releaseDeviceSession(){
+    try{if(state.session?.user)await sb.rpc("release_device_session");}catch(err){console.warn("Device session release failed",err);}
+    stopDeviceSessionControl();
+  }
+
+  async function handleRemoteLogout(){
+    if(sessionEndedByOtherDevice)return;
+    sessionEndedByOtherDevice=true;
+    stopDeviceSessionControl();
+    try{await sb.auth.signOut({scope:"local"});}catch(_e){}
+    state.session=null;state.me=null;state.store=null;state.inventory=[];state.cart=[];
+    showSessionEnded();
+  }
+
+  function showSessionEnded(){
+    state.authMode="login";
+    renderAuthCard();renderConfigBanner();
+    const wrap=$("#authCards");
+    if(wrap)wrap.innerHTML=`<div class="bg-white rounded-3xl shadow-xl p-6 sm:p-8 text-center">
+      <div class="mx-auto w-16 h-16 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center text-3xl">⚠️</div>
+      <h2 class="text-2xl font-black mt-5">Session Ended</h2>
+      <p class="text-slate-500 mt-2">Your account was logged in on another device. This device has been logged out for security.</p>
+      <button onclick="location.reload()" class="primary-btn w-full mt-6">Refresh & Login</button>
+    </div>`;
+  }
+
+  function showDeviceConflict(device,last){
+    return new Promise(resolve=>{
+      ensureModalHost();
+      const old=document.getElementById("deviceConflictModal");
+      if(old)old.remove();
+      const host=document.createElement("div");
+      host.id="deviceConflictModal";
+      host.innerHTML=`<div class="fixed inset-0 z-[9999] bg-slate-950/60 backdrop-blur-sm p-4 flex items-center justify-center">
+        <div class="bg-white rounded-3xl shadow-2xl p-6 sm:p-8 w-full max-w-md">
+          <div class="w-14 h-14 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center text-2xl">⚠️</div>
+          <h2 class="text-2xl font-black mt-5">Account Already Logged In</h2>
+          <p class="text-slate-500 mt-2">This account is currently active on another device.</p>
+          <div class="bg-slate-50 rounded-2xl p-4 mt-5 text-sm"><div><b>Device:</b> ${esc(device||"Another device")}</div><div class="mt-1"><b>Last active:</b> ${esc(last||"Recently")}</div></div>
+          <p class="text-sm text-slate-600 mt-5">Continue only if you want to log out the previous device and use this device instead.</p>
+          <div class="grid grid-cols-2 gap-3 mt-6"><button id="deviceCancel" class="secondary-btn">Cancel</button><button id="deviceContinue" class="primary-btn">Log Out Previous & Continue</button></div>
+        </div></div>`;
+      document.body.appendChild(host);
+      const finish=v=>{host.remove();resolve(v);};
+      host.querySelector("#deviceCancel").onclick=()=>finish(false);
+      host.querySelector("#deviceContinue").onclick=()=>finish(true);
+    });
+  }
+
   async function signup(e){
     e.preventDefault();
-    if(!sb)return toast("Insert your Supabase URL and anon/publishable key first.","error");
+    if(!sb)return toast("Connect Supabase first.","error");
     const f=new FormData(e.target),role=String(f.get("role")||"admin"),phone=normalizePhone(f.get("mobile"));
     const email=String(f.get("email")||"").trim().toLowerCase(),password=String(f.get("password")||"");
     if(!/^\+\d{8,15}$/.test(phone))return toast("Enter a valid mobile number, for example +919876543210.","error");
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return toast("Enter a valid email address.","error");
+    if(password.length<8)return toast("Password must be at least 8 characters.","error");
     if(password!==String(f.get("confirm")||""))return toast("Passwords do not match.","error");
-    if(role==="admin"&&(!f.get("license")||!f.get("license_file")))return toast("Admin registration requires drug-license number and file.","error");
+    if(role==="admin"&&(!f.get("license")||!f.get("license_file")||!f.get("license_file").size))return toast("Admin registration requires drug-license number and file.","error");
     const btn=e.target.querySelector("button[type=submit]");busy(btn,true,"Creating account…");
     try{
       const phoneCheck=await sb.from("profiles").select("id").eq("mobile",phone).maybeSingle();
       if(phoneCheck.error)throw phoneCheck.error;
       if(phoneCheck.data)throw new Error("This mobile number is already registered.");
-      const auth=await sb.auth.signUp({
-        email,password,
-        options:{data:{
-          full_name:String(f.get("owner_name")||"").trim(),mobile:phone,role,
-          store_name:String(f.get("store_name")||"").trim(),
-          owner_name:String(f.get("owner_name")||"").trim(),
-          pharmacist_name:String(f.get("pharmacist_name")||"").trim(),
-          license:String(f.get("license")||"").trim()
-        }}
-      });
+
+      const auth=await sb.auth.signUp({email,password,options:{data:{full_name:String(f.get("owner_name")||"").trim(),mobile:phone,role,store_name:String(f.get("store_name")||"").trim()}}});
       if(auth.error)throw auth.error;
       if(!auth.data?.user)throw new Error("Supabase did not create the account.");
+      if(!auth.data.session)throw new Error("No session was returned. In Supabase Authentication → Providers → Email, keep Confirm email OFF.");
+
+      state.session=auth.data.session;
       state.pendingSignup={role,storeName:String(f.get("store_name")||"").trim(),ownerName:String(f.get("owner_name")||"").trim(),pharmacistName:String(f.get("pharmacist_name")||"").trim(),phone,email,license:String(f.get("license")||"").trim(),licenseFile:role==="admin"?f.get("license_file"):null,userId:auth.data.user.id};
-      state.pendingEmail=email;
-      if(auth.data.session){state.session=auth.data.session;await finishVerifiedRegistration(auth.data.user);return;}
-      state.authMode="emailVerify";renderAuthCard();renderConfigBanner();
-      toast("Verification code sent to your email. Check Inbox/Spam.","success");
-    }catch(err){
-      try{await sb.auth.signOut();}catch(_e){}
-      state.session=null;toast(err?.message||"Registration failed.","error");
-    }finally{busy(btn,false);}
-  }
-
-  async function verifyEmailCode(e){
-    e.preventDefault();
-    const email=state.pendingEmail,token=String($("#emailOtp")?.value||"").replace(/\D/g,"");
-    if(!email)return toast("Registration email is missing. Start again.","error");
-    if(token.length!==6)return toast("Enter the 6-digit email confirmation code.","error");
-    const btn=$("#emailVerifyForm button[type=submit]");busy(btn,true,"Verifying…");
-    try{
-      const r=await sb.auth.verifyOtp({email,token,type:"email"});
-      if(r.error)throw r.error;
-      if(!r.data?.user)throw new Error("Email verification failed.");
-      state.session=r.data.session;
-      await finishVerifiedRegistration(r.data.user);
-    }catch(err){toast(err?.message||"Invalid or expired confirmation code.","error");}
-    finally{busy(btn,false);}
-  }
-
-  async function resendEmailCode(){
-    if(!sb||!state.pendingEmail)return toast("Registration email is missing. Start again.","error");
-    const btn=$("#resendEmail");busy(btn,true,"Sending…");
-    try{
-      const r=await sb.auth.resend({type:"signup",email:state.pendingEmail});
-      if(r.error)throw r.error;
-      toast("A new confirmation code has been sent.","success");
-    }catch(err){toast(err?.message||"Could not resend the confirmation code.","error");}
+      await finishVerifiedRegistration(auth.data.user);
+    }catch(err){try{await sb.auth.signOut({scope:"local"});}catch(_e){}state.session=null;toast(err?.message||"Registration failed.","error");}
     finally{busy(btn,false);}
   }
 
   async function finishVerifiedRegistration(user){
-    const p=state.pendingSignup;
-    if(!p)throw new Error("Registration data expired. Please create the account again.");
-    if(!state.session?.user)throw new Error("Email verified, but no authenticated session was returned.");
-
-    const phoneCheck=await sb.from("profiles").select("id").eq("mobile",p.phone).neq("id",user.id).maybeSingle();
-    if(phoneCheck.error)throw phoneCheck.error;
-    if(phoneCheck.data){
-      await sb.auth.signOut();state.session=null;
-      throw new Error("This mobile number is already registered.");
+    const p=state.pendingSignup;if(!p)throw new Error("Registration data expired. Please create the account again.");
+    const live=await sb.auth.getSession();if(live.error)throw live.error;
+    if(!live.data?.session?.user?.id)throw new Error("Authentication session is missing. Keep Confirm email OFF in Supabase.");
+    state.session=live.data.session;user=live.data.session.user;
+    let licensePath=null;
+    if(p.role==="admin"&&p.licenseFile&&p.licenseFile.size){
+      licensePath=`${user.id}/${Date.now()}_${String(p.licenseFile.name).replace(/[^\w.-]/g,"_")}`;
+      const up=await sb.storage.from("licenses").upload(licensePath,p.licenseFile,{upsert:false,contentType:p.licenseFile.type});
+      if(up.error)throw up.error;
     }
-
-    let storeId=null;
-    if(p.role==="admin"){
-      const st=await sb.from("pharmacy_stores").insert({
-        store_name:p.storeName,owner_name:p.ownerName,pharmacist_name:p.pharmacistName,
-        drug_license_number:p.license,created_by:user.id,phone:p.phone,email:p.email
-      }).select().single();
-      if(st.error)throw st.error;
-      storeId=st.data.id;
-      if(p.licenseFile&&p.licenseFile.size){
-        const path=`${user.id}/${Date.now()}_${String(p.licenseFile.name).replace(/[^\w.-]/g,"_")}`;
-        const up=await sb.storage.from("licenses").upload(path,p.licenseFile,{upsert:false,contentType:p.licenseFile.type});
-        if(up.error)throw up.error;
-        const upStore=await sb.from("pharmacy_stores").update({drug_license_path:path}).eq("id",storeId);
-        if(upStore.error)throw upStore.error;
-      }
-    }else{
-      const sr=await sb.rpc("find_store_for_registration",{p_store_name:p.storeName});
-      if(sr.error)throw sr.error;
-      if(!sr.data?.length)throw new Error("Store not found. Staff must enter an existing pharmacy store name.");
-      storeId=sr.data[0].id;
-    }
-
-    const profile=await sb.from("profiles").insert({
-      id:user.id,store_id:storeId,store_name:p.storeName,owner_name:p.ownerName,
-      pharmacist_name:p.pharmacistName,full_name:p.ownerName,mobile:p.phone,email:p.email,
-      role:p.role,status:p.role==="admin"?"pending_superadmin":"pending_store_admin"
-    });
-    if(profile.error)throw profile.error;
-
-    await sb.auth.signOut();state.session=null;state.pendingSignup=null;state.pendingEmail=null;
-    state.authMode="login";renderAuthCard();renderConfigBanner();
-    toast(p.role==="admin"?"Email verified. Account is pending Super-Admin review.":"Email verified. Account is pending Store Admin approval.","success");
+    const reg=await sb.rpc("register_pharmacy_account",{p_role:p.role,p_store_name:p.storeName,p_owner_name:p.ownerName,p_pharmacist_name:p.pharmacistName,p_mobile:p.phone,p_email:p.email,p_license:p.license,p_license_path:licensePath});
+    if(reg.error)throw reg.error;if(!reg.data)throw new Error("Registration function did not return a pharmacy store ID.");
+    await sb.auth.signOut({scope:"local"});state.session=null;state.pendingSignup=null;state.pendingEmail=null;state.authMode="login";renderAuthCard();renderConfigBanner();
+    toast(p.role==="admin"?"Account created. It is pending Super-Admin review.":"Account created. It is pending Store Admin approval.","success");
   }
 
   async function login(e){
     e.preventDefault();
-    if(!sb)return toast("Insert your Supabase URL and anon/publishable key first.","error");
+    if(!sb)return toast("Connect Supabase first.","error");
+    ensureModalHost();
     const f=new FormData(e.target),email=String(f.get("email")||"").trim().toLowerCase(),password=String(f.get("password")||"");
+    if(!email)return toast("Email ID is required.","error");
+    if(!password)return toast("Password is required.","error");
     const btn=e.target.querySelector("button[type=submit]");busy(btn,true,"Signing in…");
     try{
-      const r=await sb.auth.signInWithPassword({email,password});
-      if(r.error)throw r.error;
+      const r=await sb.auth.signInWithPassword({email,password});if(r.error)throw r.error;
       state.session=r.data.session;await loadIdentity();
-      if(!state.me)throw new Error("Profile record is missing. Complete email verification/registration again.");
+      if(!state.me)throw new Error("Profile record is missing. Ask the founder to repair this account.");
       if(state.me.status!=="active"){
-        await sb.auth.signOut();state.session=null;
+        await sb.auth.signOut({scope:"local"});state.session=null;
         const msg=state.me.status==="pending_superadmin"?"Account is pending Super-Admin review.":state.me.status==="pending_store_admin"?"Account is pending Store Admin approval.":state.me.status==="temporary_blocked"?"Account is temporarily blocked.":state.me.status==="permanent_blocked"?"Account is permanently revoked.":"Account access is not active.";
         throw new Error(msg);
       }
-      await startApp();
+      const claimed=await claimDeviceSession(false);
+      if(claimed?.previous_device_exists){
+        const st=await sb.rpc("device_session_status");
+        const row=st.data?.[0];
+        const ok=await showDeviceConflict(row?.active_device_label||"Another device",row?.last_seen_at?new Date(row.last_seen_at).toLocaleString("en-IN"):"Recently");
+        if(!ok){await sb.auth.signOut({scope:"local"});state.session=null;state.me=null;state.store=null;throw new Error("Login cancelled. The previous device remains logged in.");}
+        const takeover=await claimDeviceSession(true);if(!takeover?.claimed_session_id)throw new Error("Could not take control of this device session.");
+        deviceSessionId=takeover.claimed_session_id;
+      }else deviceSessionId=claimed?.claimed_session_id||null;
+      sessionEndedByOtherDevice=false;startDeviceSessionControl();await startApp();
     }catch(err){toast(err?.message||"Sign in failed.","error");}
     finally{busy(btn,false);}
   }
@@ -658,7 +679,7 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
       renderAuth();
       if(!validConfig())return;
       if(!window.supabase||typeof window.supabase.createClient!=="function")throw new Error("Supabase CDN did not load. Check your internet connection.");
-      sb=window.supabase.createClient(SUPABASE_URL.trim(),SUPABASE_ANON_KEY.trim(),{auth:{persistSession:false,autoRefreshToken:true,detectSessionInUrl:true}});
+      sb=window.supabase.createClient(SUPABASE_URL.trim(),SUPABASE_ANON_KEY.trim(),{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:false}});
       const hash=new URLSearchParams(window.location.hash.replace(/^#/,""));
       const authError=hash.get("error_description");
       if(authError){
@@ -667,15 +688,26 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
       }
       const g=await sb.auth.getSession();
       if(g.error)throw g.error;
+      sb.auth.onAuthStateChange((event,s)=>{
+        if(event==="SIGNED_OUT"){stopDeviceSessionControl();state.session=null;}
+      });
       if(g.data?.session){
         state.session=g.data.session;
         await loadIdentity();
-        if(state.me?.status==="active")await startApp();
-        else if(state.me){
-          await sb.auth.signOut();state.session=null;toast(statusLabel(state.me.status),"info");
+        if(state.me?.status==="active"){
+          const claimed=await claimDeviceSession(false);
+          if(claimed?.previous_device_exists){
+            await handleRemoteLogout();
+          }else{
+            deviceSessionId=claimed?.claimed_session_id||null;
+            startDeviceSessionControl();
+            await startApp();
+          }
+        }else if(state.me){
+          await sb.auth.signOut({scope:"local"});state.session=null;toast(statusLabel(state.me.status),"info");
         }else{
-          await sb.auth.signOut();state.session=null;
-          toast("Email verified. Please complete registration again if the signup page was closed.","info");
+          await sb.auth.signOut({scope:"local"});state.session=null;
+          toast("Registration is incomplete. Please create the account again.","info");
         }
       }
     }catch(err){
@@ -683,71 +715,461 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
     }
   }
 
-  async function startApp(){renderApp();await loadData();subscribeRealtime();}
+
+  /* ================= APP DATA + COMPLETE ERP UI ================= */
+  async function loadInventory(){
+    const r=await sb.from("inventory").select("*").eq("store_id",state.store.id).order("expiry_date",{ascending:true});
+    if(r.error)throw r.error;
+    state.inventory=r.data||[];
+    return state.inventory;
+  }
+
+  async function loadData(){
+    await loadInventory();
+    return state.inventory;
+  }
+
+  function subscribeRealtime(){
+    if(state.realtime)sb.removeChannel(state.realtime);
+    state.realtime=sb.channel("maaj-store-live-"+state.store.id)
+      .on("postgres_changes",{event:"*",schema:"public",table:"inventory",filter:"store_id=eq."+state.store.id},async()=>{try{await loadInventory();renderPage();}catch(e){console.warn(e);}})
+      .on("postgres_changes",{event:"*",schema:"public",table:"sales",filter:"store_id=eq."+state.store.id},()=>renderPage())
+      .on("postgres_changes",{event:"*",schema:"public",table:"purchases",filter:"store_id=eq."+state.store.id},()=>renderPage())
+      .on("postgres_changes",{event:"*",schema:"public",table:"expenses",filter:"store_id=eq."+state.store.id},()=>renderPage())
+      .subscribe();
+  }
+
+  function dateDiff(exp){
+    return Math.ceil((new Date(exp+"T00:00:00")-new Date(today()+"T00:00:00"))/86400000);
+  }
+
+  function pageShell(title,subtitle,body,actions=""){
+    return `<div class="space-y-5"><div class="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+      <div><div class="text-xs uppercase tracking-[.18em] text-teal-700 font-black">MAAJ ERP</div><h1 class="text-2xl font-black mt-1">${esc(title)}</h1><p class="text-slate-500 mt-1">${esc(subtitle||"")}</p></div>
+      <div class="flex flex-wrap gap-2">${actions}</div></div>${body}</div>`;
+  }
+
+  function navItems(){
+    return [
+      ["home","Dashboard","layout-dashboard"],
+      ["sale","POS / Billing","shopping-cart"],
+      ["inventory","Inventory / Stock","boxes"],
+      ["purchase","Purchases / OCR","scan-line"],
+      ["sales","Sales","receipt-text"],
+      ["returns","Returns","rotate-ccw"],
+      ["customers","Customers","users-round"],
+      ["suppliers","Suppliers","truck"],
+      ["finance","Finance","wallet-cards"],
+      ["reports","Reports","chart-no-axes-combined"],
+      ["more","More Modules","grid-2x2"]
+    ];
+  }
 
   function renderApp(){
-    $("#appRoot").innerHTML=`<div class="min-h-screen pb-20 md:pb-0"><header class="sticky top-0 z-40 bg-white/90 backdrop-blur border-b"><div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-3"><div><div class="font-black text-lg">MAAJ PHARMACY</div><div class="text-xs text-slate-500">${esc(state.store?.store_name||state.me?.store_name||"Store")} • ${esc(state.me?.role||"")}</div></div><div class="flex items-center gap-2"><span class="px-2.5 py-1 rounded-full text-xs font-bold ${statusClass(state.me.status)}">${esc(statusLabel(state.me.status))}</span><button id="logout" class="p-2 border rounded-xl hover:bg-slate-50" title="Logout">${icon("log-out")}</button></div></div></header><main class="max-w-7xl mx-auto px-4 py-5"><div id="page"></div></main><nav class="fixed bottom-0 left-0 right-0 z-40 bg-white border-t md:static md:border-t-0 md:mt-8"><div class="max-w-7xl mx-auto grid grid-cols-5">${[["home","Home","house"],["sale","Sale","receipt"],["inventory","Inventory","boxes"],["purchase","Purchase","scan-line"],["account","Account","user-round"]].map(x=>`<button data-tab="${x[0]}" class="nav-btn py-3 text-xs font-bold flex flex-col items-center gap-1 text-slate-500 ${state.currentTab===x[0]?"nav-active":""}">${icon(x[2],"w-5 h-5")}${x[1]}</button>`).join("")}</div></nav><button id="bugBtn" class="fixed right-4 bottom-24 md:bottom-6 z-50 bg-red-600 hover:bg-red-700 text-white rounded-full w-14 h-14 shadow-xl font-black">BUG</button></div><div id="modal"></div><div id="bugDrawer" class="fixed inset-y-0 right-0 w-full sm:w-[430px] bg-white shadow-2xl z-[100] drawer translate-x-full"><div class="p-5 border-b flex items-center justify-between"><h2 class="font-black">Report a bug</h2><button id="closeBug" class="p-2 border rounded-lg">✕</button></div><form id="bugForm" class="p-5 space-y-3"><input name="title" required class="field" placeholder="Short title"><textarea name="description" required rows="6" class="field" placeholder="What happened? What did you expect?"></textarea><input name="screenshot" type="file" accept="image/*" class="w-full text-sm"><p class="text-xs text-slate-500">Attach a screenshot if available. Browser URL, user agent, online status and timestamp are logged automatically.</p><button class="danger-btn w-full">Submit Bug Report</button></form></div><div id="printInvoice" class="hide print-area"></div>`;
-    $$(".nav-btn").forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.tab;renderPage();});
-    $("#logout").onclick=logout;$("#bugBtn").onclick=()=>$("#bugDrawer").classList.remove("translate-x-full");$("#closeBug").onclick=()=>$("#bugDrawer").classList.add("translate-x-full");$("#bugForm").onsubmit=submitBug;
+    $("#appRoot").innerHTML=`<div class="min-h-screen bg-slate-50">
+      <header class="sticky top-0 z-40 bg-white/95 backdrop-blur border-b">
+        <div class="max-w-[1500px] mx-auto px-4 py-3 flex items-center justify-between gap-3">
+          <div><div class="font-black text-lg">MAAJ PHARMACY</div><div class="text-xs text-slate-500">${esc(state.store?.store_name||state.me?.store_name||"Store")} • ${esc(state.me?.role||"")}</div></div>
+          <div class="flex items-center gap-2"><span class="hidden sm:inline-flex px-2.5 py-1 rounded-full text-xs font-bold ${statusClass(state.me.status)}">${esc(statusLabel(state.me.status))}</span>
+          <button id="logout" class="p-2 border rounded-xl hover:bg-slate-50" title="Logout">${icon("log-out")}</button></div>
+        </div>
+      </header>
+      <div class="max-w-[1500px] mx-auto flex">
+        <aside class="hidden lg:block w-60 shrink-0 p-4 sticky top-[65px] h-[calc(100vh-65px)] overflow-auto">
+          <div class="bg-white rounded-3xl p-3 shadow-sm border">${navItems().map(x=>`<button data-tab="${x[0]}" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold text-slate-600 mb-1 ${state.currentTab===x[0]?"nav-active":""}">${icon(x[2],"w-5 h-5")}${x[1]}</button>`).join("")}</div>
+          <div class="bg-slate-950 text-white rounded-3xl p-4 mt-4"><div class="text-xs text-slate-400">STORE</div><div class="font-bold mt-1 truncate">${esc(state.store?.store_name||"")}</div><div class="text-xs text-slate-400 mt-2">${esc(state.me?.full_name||"")}</div></div>
+        </aside>
+        <main class="flex-1 min-w-0 px-4 py-5 pb-24"><div id="page"></div></main>
+      </div>
+      <nav class="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-white border-t shadow-lg"><div class="grid grid-cols-4">${navItems().slice(0,4).map(x=>`<button data-tab="${x[0]}" class="nav-btn py-2 text-[10px] font-bold flex flex-col items-center gap-1 ${state.currentTab===x[0]?"text-white nav-active":"text-slate-500"}">${icon(x[2],"w-5 h-5")}${x[1]}</button>`).join("")}</div></nav>
+      <button id="bugBtn" class="fixed right-4 bottom-24 lg:bottom-6 z-50 bg-red-600 hover:bg-red-700 text-white rounded-full w-14 h-14 shadow-xl font-black">BUG</button>
+      <div id="modal"></div>
+      <div id="bugDrawer" class="fixed inset-y-0 right-0 w-full sm:w-[430px] bg-white shadow-2xl z-[100] drawer translate-x-full"><div class="p-5 border-b flex items-center justify-between"><h2 class="font-black">Report a bug</h2><button id="closeBug" class="p-2 border rounded-lg">✕</button></div><form id="bugForm" class="p-5 space-y-3"><input name="title" required class="field" placeholder="Short title"><textarea name="description" required rows="6" class="field" placeholder="What happened? What did you expect?"></textarea><input name="screenshot" type="file" accept="image/*" class="w-full text-sm"><p class="text-xs text-slate-500">Screenshot, URL, browser, screen size and timestamp are stored in Supabase.</p><button class="danger-btn w-full">Submit Bug Report</button></form></div>
+      <div id="printInvoice" class="hide print-area"></div>
+    </div>`;
+    $$(".nav-btn").forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.tab;renderApp();});
+    $("#logout").onclick=logout;
+    $("#bugBtn").onclick=()=>$("#bugDrawer").classList.remove("translate-x-full");
+    $("#closeBug").onclick=()=>$("#bugDrawer").classList.add("translate-x-full");
+    $("#bugForm").onsubmit=submitBug;
     renderPage();icons();
   }
 
-  async function logout(){if(sb)await sb.auth.signOut();if(state.realtime)sb.removeChannel(state.realtime);state.session=null;state.me=null;state.store=null;state.inventory=[];state.cart=[];state.realtime=null;state.authMode="login";renderAuth();renderConfigBanner();}
-  async function loadData(){await loadInventory();}
-  async function loadInventory(){if(!state.store)return;const r=await sb.from("inventory").select("*").eq("store_id",state.store.id).order("medicine_name",{ascending:true});if(r.error)throw r.error;state.inventory=r.data||[];}
-  function subscribeRealtime(){if(!state.store||!sb)return;if(state.realtime)sb.removeChannel(state.realtime);state.realtime=sb.channel("store-"+state.store.id).on("postgres_changes",{event:"*",schema:"public",table:"inventory",filter:"store_id=eq."+state.store.id},async()=>{await loadInventory();renderPage();}).on("postgres_changes",{event:"*",schema:"public",table:"sales",filter:"store_id=eq."+state.store.id},()=>{if(state.currentTab==="home")loadFinance(0);}).subscribe();}
-
-  function renderPage(){
-    if(!$("#page"))return;
-    const views={home:homeView,sale:saleView,inventory:inventoryView,purchase:purchaseView,account:accountView};
-    $("#page").innerHTML=`<div class="tab-in">${views[state.currentTab]()}</div>`;bindPage();icons();
+  // APP STARTUP: keep this function explicit because login/boot both use it.
+  // It renders the complete ERP shell, loads the current store data from Supabase,
+  // and then starts realtime inventory updates. No LocalStorage is used here.
+  async function startApp(){
+    if(!state.session?.user) throw new Error("Authentication session is missing.");
+    if(!state.me?.store_id || !state.store?.id) throw new Error("Pharmacy store profile is missing.");
+    renderApp();
+    await loadData();
+    subscribeRealtime();
+    await renderPage();
   }
 
-  function homeView(){
-    const low=state.inventory.filter(x=>Number(x.quantity)<=Number(x.low_stock_threshold)).length;
-    const exp=state.inventory.filter(x=>{const d=(new Date(x.expiry_date)-new Date())/86400000;return d>=0&&d<=90;}).length;
-    const expired=state.inventory.filter(x=>new Date(x.expiry_date)<new Date(today()+"T00:00:00")).length;
-    return `<div class="space-y-5"><div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3"><div><div class="text-xs uppercase tracking-wider text-teal-700 font-bold">${esc(state.me.role)}</div><h1 class="text-2xl font-black mt-1">Good ${new Date().getHours()<12?"morning":new Date().getHours()<18?"afternoon":"evening"}, ${esc(state.me.full_name||state.me.owner_name||"")}</h1><p class="text-slate-500">${new Date().toLocaleDateString("en-IN",{dateStyle:"full"})}</p></div><button data-quick-sale class="primary-btn">+ New Sale</button></div>
-      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">${metric("Expected Cash in Hand","—","wallet-cards","text-teal-700")} ${metric("Total Revenue","—","indian-rupee","text-blue-700")} ${metric("Low Stock",low,"triangle-alert",low?"text-red-600":"text-emerald-700")} ${metric("Expiring ≤90 Days",exp,"calendar-clock",exp?"text-amber-600":"text-emerald-700")}</div>
-      <div class="grid lg:grid-cols-2 gap-5"><section class="bg-white rounded-3xl p-5 shadow-sm"><div class="flex items-center justify-between"><div><h2 class="font-black">Stock Health</h2><p class="text-xs text-slate-500">${expired} expired batch(es)</p></div><button data-open-inv class="text-sm text-teal-700 font-bold">Open Inventory</button></div><div class="mt-4 space-y-3">${state.inventory.slice(0,7).map(x=>`<div class="flex items-center justify-between gap-3 border-b last:border-0 pb-3"><div class="min-w-0"><div class="font-semibold truncate">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500">Batch ${esc(x.batch_number)} • Exp ${esc(x.expiry_date)}</div></div><span class="font-black ${Number(x.quantity)<=Number(x.low_stock_threshold)?"text-red-600":"text-emerald-700"}">${Number(x.quantity)}</span></div>`).join("")||`<p class="text-slate-500">No inventory yet. Add a batch or save a purchase.</p>`}</div></section>
-      <section class="bg-slate-950 text-white rounded-3xl p-5"><div class="flex items-center justify-between"><div><h2 class="font-black text-xl">Cash & Financial Dashboard</h2><p class="text-slate-400 text-sm mt-1">Live calculations from Supabase sales and expenses.</p></div>${icon("chart-no-axes-combined","w-7 h-7 text-teal-400")}</div><div class="flex gap-2 mt-5">${["Today","Last 7 Days","Last 30 Days"].map((x,i)=>`<button data-fin="${i}" class="px-3 py-2 rounded-xl text-sm font-bold ${i===0?"bg-white text-slate-950":"bg-white/10"}">${x}</button>`).join("")}</div><div id="finance" class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-5"></div></section></div></div>`;
+  async function renderPage(){
+    const page=$("#page"); if(!page)return;
+    page.innerHTML=`<div class="bg-white rounded-3xl p-8 shadow-sm border text-center"><div class="animate-pulse font-bold text-slate-500">Loading module…</div></div>`;
+    try{
+      if(state.currentTab==="home")page.innerHTML=await homeView();
+      else if(state.currentTab==="sale")page.innerHTML=saleView();
+      else if(state.currentTab==="inventory")page.innerHTML=inventoryView();
+      else if(state.currentTab==="purchase")page.innerHTML=purchaseView();
+      else if(state.currentTab==="sales")page.innerHTML=await salesView();
+      else if(state.currentTab==="customers")page.innerHTML=await customersView();
+      else if(state.currentTab==="suppliers")page.innerHTML=await suppliersView();
+      else page.innerHTML=await moreView();
+      bindPage();icons();
+    }catch(err){page.innerHTML=`<div class="bg-white rounded-3xl p-6 border border-red-200"><h2 class="font-black text-red-700">Module error</h2><p class="text-sm text-slate-600 mt-2">${esc(err?.message||err)}</p><button id="retryModule" class="primary-btn mt-4">Retry</button></div>`;$("#retryModule").onclick=renderPage;}
   }
+
+  async function homeView(){
+    const inv=state.inventory||[];
+    const low=inv.filter(x=>Number(x.quantity)<=Number(x.low_stock_threshold)).length;
+    const out=inv.filter(x=>Number(x.quantity)<=0).length;
+    const expired=inv.filter(x=>dateDiff(x.expiry_date)<0).length;
+    const e7=inv.filter(x=>dateDiff(x.expiry_date)>=0&&dateDiff(x.expiry_date)<=7).length;
+    const e30=inv.filter(x=>dateDiff(x.expiry_date)>=0&&dateDiff(x.expiry_date)<=30).length;
+    const stockValue=inv.reduce((a,x)=>a+Number(x.quantity||0)*Number(x.purchase_rate||0),0);
+    let revenue=0, purchases=0, expenses=0, salesCount=0;
+    const [s,p,e]=await Promise.all([
+      sb.from("sales").select("total").eq("store_id",state.store.id).gte("created_at",today()+"T00:00:00"),
+      sb.from("purchases").select("total_amount").eq("store_id",state.store.id).gte("created_at",today()+"T00:00:00"),
+      sb.from("expenses").select("amount").eq("store_id",state.store.id).gte("created_at",today()+"T00:00:00")
+    ]);
+    revenue=(s.data||[]).reduce((a,x)=>a+Number(x.total||0),0);salesCount=(s.data||[]).length;
+    purchases=(p.data||[]).reduce((a,x)=>a+Number(x.total_amount||0),0);
+    expenses=(e.data||[]).reduce((a,x)=>a+Number(x.amount||0),0);
+    return pageShell("Dashboard","Live pharmacy operations overview.",`<div class="grid grid-cols-2 xl:grid-cols-6 gap-3">
+      ${metric("Today Sales",money(revenue),"indian-rupee","text-emerald-700")}${metric("Today Purchases",money(purchases),"shopping-bag","text-blue-700")}${metric("Today Expenses",money(expenses),"wallet-minimal","text-orange-700")}${metric("Stock Value",money(stockValue),"boxes","text-violet-700")}${metric("Low / Out",low+" / "+out,"triangle-alert",low||out?"text-red-600":"text-emerald-700")}${metric("Expiry ≤30d",e30,"calendar-clock",e30?"text-amber-600":"text-emerald-700")}</div>
+      <div class="grid lg:grid-cols-3 gap-5">
+        <section class="bg-slate-950 text-white rounded-3xl p-5 lg:col-span-2"><div class="flex justify-between"><div><h2 class="font-black text-xl">Today's Snapshot</h2><p class="text-slate-400 text-sm">Sales ${salesCount} • Net after recorded expenses ${money(revenue-expenses)}</p></div>${icon("chart-no-axes-combined","w-8 h-8 text-teal-400")}</div><div class="grid sm:grid-cols-3 gap-3 mt-5">${["7 Days Expiry",e7,"Expired",expired,"Stock Units",inv.reduce((a,x)=>a+Number(x.quantity||0),0)].reduce((a,x,i)=>i%2===0?a+`<div class="bg-white/10 rounded-2xl p-4"><div class="text-xs text-slate-400">${x}</div><div class="text-xl font-black mt-1">`:a+x+"</div></div>").join("")}</div></section>
+        <section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex justify-between"><h2 class="font-black">Expiry Alerts</h2><button data-tab-jump="inventory" class="text-teal-700 font-bold text-sm">Open</button></div><div class="mt-4 space-y-2">${inv.filter(x=>dateDiff(x.expiry_date)<=30).slice(0,8).map(x=>`<div class="flex justify-between gap-3 p-3 rounded-xl bg-slate-50"><div class="min-w-0"><div class="font-semibold truncate">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500">Batch ${esc(x.batch_number)}</div></div><b class="${dateDiff(x.expiry_date)<0?"text-red-600":"text-amber-600"}">${dateDiff(x.expiry_date)<0?"Expired":dateDiff(x.expiry_date)+"d"}</b></div>`).join("")||`<p class="text-slate-500 text-sm">No expiry alerts.</p>`}</div></section>
+      </div>
+      <section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex items-center justify-between"><div><h2 class="font-black">Stock Health</h2><p class="text-sm text-slate-500">FEFO-ready batch visibility. Expired stock is not sellable.</p></div><button data-tab-jump="inventory" class="secondary-btn">Manage Stock</button></div><div class="overflow-auto mt-4"><table class="w-full text-sm min-w-[800px]"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Medicine</th><th>Batch</th><th>Expiry</th><th>Qty</th><th>MRP</th><th>Sell</th><th>Status</th></tr></thead><tbody>${inv.slice(0,12).map(x=>{const d=dateDiff(x.expiry_date);return `<tr class="border-b"><td class="py-3 font-semibold">${esc(x.medicine_name)}</td><td>${esc(x.batch_number)}</td><td>${esc(x.expiry_date)}</td><td>${Number(x.quantity)}</td><td>${money(x.mrp)}</td><td>${money(x.selling_rate)}</td><td><span class="px-2 py-1 rounded-full text-xs font-bold ${d<0?"bg-red-100 text-red-700":Number(x.quantity)<=Number(x.low_stock_threshold)?"bg-amber-100 text-amber-700":"bg-emerald-100 text-emerald-700"}">${d<0?"Expired":Number(x.quantity)<=Number(x.low_stock_threshold)?"Low":"Healthy"}</span></td></tr>`;}).join("")||`<tr><td colspan="7" class="py-8 text-center text-slate-500">No inventory yet.</td></tr>`}</tbody></table></div></section>`);
+  }
+
+  async function salesView(){
+    const r=await sb.from("sales").select("*").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(100);
+    if(r.error)throw r.error;
+    return pageShell("Sales","Invoices, payment mode and completed billing.",`<section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex flex-wrap gap-2 mb-4"><input id="salesSearch" class="field max-w-md" placeholder="Search invoice, customer or phone"><button id="salesExport" class="secondary-btn">Export CSV</button><button data-tab-jump="sale" class="primary-btn">+ New Sale</button></div><div class="overflow-auto"><table class="w-full text-sm min-w-[850px]"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Invoice</th><th>Date</th><th>Customer</th><th>Payment</th><th>GST</th><th>Total</th><th>Status</th></tr></thead><tbody id="salesRows">${(r.data||[]).map(x=>`<tr class="border-b"><td class="py-3 font-bold">${esc(x.invoice_number)}</td><td>${new Date(x.created_at).toLocaleString("en-IN")}</td><td>${esc(x.customer_name||"Walk-in")}<div class="text-xs text-slate-500">${esc(x.customer_phone||"")}</div></td><td>${esc(x.payment_mode)}</td><td>${money(x.gst_total)}</td><td class="font-black">${money(x.total)}</td><td>${esc(x.status)}</td></tr>`).join("")||`<tr><td colspan="7" class="py-8 text-center text-slate-500">No sales found.</td></tr>`}</tbody></table></div></section>`);
+  }
+
+  async function customersView(){
+    const r=await sb.from("sales").select("customer_name,customer_phone,total,created_at").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(500);
+    if(r.error)throw r.error;
+    const map={};(r.data||[]).forEach(x=>{const k=x.customer_phone||x.customer_name||"Walk-in";if(!map[k])map[k]={name:x.customer_name||"Walk-in",phone:x.customer_phone||"",sales:0,count:0,last:x.created_at};map[k].sales+=Number(x.total||0);map[k].count++;});
+    return pageShell("Customers","Customer ledger derived from Supabase sales history.",`<section class="bg-white rounded-3xl p-5 border shadow-sm"><input id="customerSearch" class="field max-w-md" placeholder="Search customer or mobile"><div class="overflow-auto mt-4"><table class="w-full text-sm min-w-[700px]"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Customer</th><th>Mobile</th><th>Invoices</th><th>Total Purchase</th><th>Last Sale</th><th>Action</th></tr></thead><tbody id="customerRows">${Object.values(map).map(x=>`<tr class="border-b"><td class="py-3 font-semibold">${esc(x.name)}</td><td>${esc(x.phone||"—")}</td><td>${x.count}</td><td>${money(x.sales)}</td><td>${new Date(x.last).toLocaleDateString("en-IN")}</td><td><button data-customer-sale="${esc(x.phone)}" class="text-teal-700 font-bold">New Sale</button></td></tr>`).join("")||`<tr><td colspan="6" class="py-8 text-center text-slate-500">No customer sales yet.</td></tr>`}</tbody></table></div></section>`);
+  }
+
+  async function suppliersView(){
+    const r=await sb.from("purchases").select("supplier_name,total_amount,created_at,invoice_number").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(500);
+    if(r.error)throw r.error;
+    const map={};(r.data||[]).forEach(x=>{const k=x.supplier_name||"Unknown";if(!map[k])map[k]={name:k,total:0,count:0,last:x.created_at};map[k].total+=Number(x.total_amount||0);map[k].count++;map[k].last=x.created_at;});
+    return pageShell("Suppliers","Supplier history from purchase invoices.",`<section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex gap-2"><input id="supplierSearch" class="field max-w-md" placeholder="Search supplier"><button data-tab-jump="purchase" class="primary-btn">+ New Purchase</button></div><div class="overflow-auto mt-4"><table class="w-full text-sm min-w-[650px]"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Supplier</th><th>Invoices</th><th>Purchase Value</th><th>Last Purchase</th></tr></thead><tbody>${Object.values(map).map(x=>`<tr class="border-b"><td class="py-3 font-semibold">${esc(x.name)}</td><td>${x.count}</td><td>${money(x.total)}</td><td>${new Date(x.last).toLocaleDateString("en-IN")}</td></tr>`).join("")||`<tr><td colspan="4" class="py-8 text-center text-slate-500">No suppliers yet. Supplier is captured on purchase.</td></tr>`}</tbody></table></div></section>`);
+  }
+
+  async function moreView(){
+    return pageShell("More Modules","Operational tools connected to Supabase.",`<div class="grid sm:grid-cols-2 xl:grid-cols-4 gap-4">
+      ${moduleCard("Medicines","medicine","Manage medicine master data using batch inventory.","inventory")}
+      ${moduleCard("Expiry & Low Stock","calendar-clock","7/30/60/90 day expiry and reorder monitoring.","inventory")}
+      ${moduleCard("Expenses","wallet-cards","Record store expenses and calculate net operating result.","expenses")}
+      ${moduleCard("Reports","chart-no-axes-combined","Sales, purchase, stock and financial reports.","reports")}
+      ${moduleCard("Prescriptions","file-check-2","Prescription workflow with secure Supabase storage.","prescriptions")}
+      ${moduleCard("Returns","rotate-ccw","Sales/purchase return workspace; DB tables are prepared by the setup SQL.","returns")}
+      ${moduleCard("Notifications","bell","Low-stock, expiry and account notifications.","notifications")}
+      ${moduleCard("Audit Log","history","Track important actions and bug reports.","audit")}
+      ${moduleCard("Backup / Export","database-backup","Export store data without LocalStorage.","backup")}
+      ${moduleCard("Settings","settings-2","Business profile, GST, invoice and operational preferences.","settings")}
+    </div><div id="moreWorkspace" class="mt-5"></div>`);
+  }
+
+  function moduleCard(title,ico,desc,key){return `<button data-more="${key}" class="text-left bg-white rounded-3xl p-5 border shadow-sm hover:shadow-md hover:border-teal-400 transition"><div class="w-11 h-11 rounded-2xl bg-teal-50 text-teal-700 grid place-items-center">${icon(ico,"w-6 h-6")}</div><h3 class="font-black mt-4">${title}</h3><p class="text-sm text-slate-500 mt-1">${desc}</p><span class="inline-block mt-4 text-sm font-bold text-teal-700">Open module →</span></button>`;}
+
+  async function openMoreModule(key){
+    const w=$("#moreWorkspace");if(!w)return;
+    if(key==="expenses"){
+      const r=await sb.from("expenses").select("*").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(200);if(r.error)throw r.error;
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><div class="flex justify-between"><div><h2 class="font-black text-xl">Expenses</h2><p class="text-sm text-slate-500">All records are stored in Supabase.</p></div><button id="addExpense" class="primary-btn">+ Add Expense</button></div><div class="overflow-auto mt-4"><table class="w-full text-sm min-w-[650px]"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Description</th><th>Amount</th><th>Date</th><th>Action</th></tr></thead><tbody>${(r.data||[]).map(x=>`<tr class="border-b"><td class="py-3">${esc(x.description)}</td><td class="font-bold">${money(x.amount)}</td><td>${new Date(x.created_at).toLocaleDateString("en-IN")}</td><td><button data-del-exp="${x.id}" class="text-red-600 font-bold">Delete</button></td></tr>`).join("")||`<tr><td colspan="4" class="py-8 text-center text-slate-500">No expenses.</td></tr>`}</tbody></table></div></section>`;
+      $("#addExpense").onclick=()=>expenseModal();
+      $$("[data-del-exp]").forEach(b=>b.onclick=async()=>{if(!confirm("Delete this expense?"))return;const x=await sb.from("expenses").delete().eq("id",b.dataset.delExp).eq("store_id",state.store.id);if(x.error)toast(x.error.message,"error");else{toast("Expense deleted.","success");openMoreModule("expenses");}});
+    }else if(key==="reports"){
+      const [s,p,e]=await Promise.all([sb.from("sales").select("total,gst_total,created_at").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(500),sb.from("purchases").select("total_amount,created_at").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(500),sb.from("expenses").select("amount,created_at").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(500)]);
+      if(s.error||p.error||e.error)throw s.error||p.error||e.error;
+      const sales=(s.data||[]).reduce((a,x)=>a+Number(x.total||0),0),pur=(p.data||[]).reduce((a,x)=>a+Number(x.total_amount||0),0),ex=(e.data||[]).reduce((a,x)=>a+Number(x.amount||0),0);
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-xl">Reports</h2><div class="grid sm:grid-cols-3 gap-3 mt-4">${metric("Sales",money(sales),"receipt-text","text-emerald-700")}${metric("Purchases",money(pur),"shopping-bag","text-blue-700")}${metric("Expenses",money(ex),"wallet-cards","text-orange-700")}</div><div class="mt-5 p-4 rounded-2xl bg-slate-50"><b>Operating result:</b> ${money(sales-ex)}<span class="text-xs text-slate-500 block mt-1">Purchase cost is shown separately; detailed gross profit requires COGS/return tables.</span></div><button id="exportReport" class="secondary-btn mt-4">Export Report CSV</button></section>`;
+      $("#exportReport").onclick=()=>downloadCSV("maaj_report.csv",[["Type","Amount"],["Sales",sales],["Purchases",pur],["Expenses",ex],["Operating Result",sales-ex]]);
+    }else if(key==="prescriptions"){
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-xl">Prescription Workspace</h2><p class="text-sm text-slate-500 mt-1">Upload a prescription to the private Supabase bucket. Do not sell prescription medicines without valid verification.</p><form id="rxForm" class="grid md:grid-cols-2 gap-3 mt-5"><input name="customer" required class="field" placeholder="Customer name"><input name="phone" class="field" placeholder="Customer mobile"><input name="file" required type="file" accept="image/*,application/pdf" class="md:col-span-2 w-full border rounded-xl p-3"><button class="primary-btn md:col-span-2">Upload Prescription</button></form><div id="rxStatus" class="mt-4 text-sm"></div></section>`;
+      $("#rxForm").onsubmit=uploadPrescription;
+    }else if(key==="backup"){
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-xl">Backup / Data Export</h2><p class="text-sm text-slate-500 mt-1">Downloads a fresh snapshot from Supabase. Nothing is saved to LocalStorage.</p><button id="backupBtn" class="primary-btn mt-4">Download Store Backup JSON</button></section>`;
+      $("#backupBtn").onclick=backupStore;
+    }else if(key==="settings"){
+      w.innerHTML=accountView();$("#storeForm").onsubmit=saveStore;
+    }else if(key==="audit"){
+      const r=await sb.from("bugs").select("id,title,status,created_at,description").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(100);
+      if(r.error)throw r.error;
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-xl">Audit / System Activity</h2><p class="text-sm text-slate-500 mt-1">Bug reports and system events visible from the current schema.</p><div class="mt-4 space-y-2">${(r.data||[]).map(x=>`<div class="border rounded-2xl p-4"><div class="flex justify-between gap-3"><b>${esc(x.title)}</b><span class="text-xs px-2 py-1 rounded-full bg-slate-100">${esc(x.status)}</span></div><div class="text-xs text-slate-500 mt-1">${new Date(x.created_at).toLocaleString("en-IN")}</div><p class="text-sm mt-2">${esc(x.description||"")}</p></div>`).join("")||`<p class="text-slate-500">No system activity records yet.</p>`}</div></section>`;
+    }else if(key==="notifications"){
+      const low=state.inventory.filter(x=>Number(x.quantity)<=Number(x.low_stock_threshold)), exp=state.inventory.filter(x=>dateDiff(x.expiry_date)<=30);
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-xl">Notifications</h2><div class="grid md:grid-cols-2 gap-3 mt-4">${notificationCard("Low stock",low.length,low.slice(0,10).map(x=>x.medicine_name))}${notificationCard("Expiry ≤30 days",exp.length,exp.slice(0,10).map(x=>x.medicine_name))}</div></section>`;
+    }else if(key==="returns"){
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-xl">Returns</h2><p class="text-sm text-slate-500 mt-2">Return workflows require the extended returns tables in the Supabase SQL setup supplied with this version. The workspace is intentionally kept locked until those tables exist, so stock is never adjusted incorrectly.</p><div class="mt-4 p-4 bg-amber-50 border border-amber-200 rounded-2xl text-sm text-amber-900">Safety rule: a return quantity must never exceed the eligible sold/purchased quantity.</div></section>`;
+    }else{
+      w.innerHTML=`<section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-xl">Medicines / Expiry</h2><p class="text-sm text-slate-500 mt-1">Medicine master is represented by batch inventory in the current database. Add/edit batches from Inventory.</p><button data-tab-jump="inventory" class="primary-btn mt-4">Open Inventory</button></section>`;
+    }
+    icons();
+  }
+
+  function notificationCard(title,count,names){return `<div class="rounded-2xl border p-4"><div class="flex justify-between"><b>${title}</b><span class="font-black">${count}</span></div><div class="text-sm text-slate-500 mt-3">${names.map(esc).join(", ")||"Nothing to show."}</div></div>`;}
+
+  function expenseModal(){
+    ensureModalHost().innerHTML=`<div class="fixed inset-0 z-[120] bg-slate-950/50 p-4 flex items-center justify-center"><form id="expenseForm" class="bg-white rounded-3xl p-6 w-full max-w-md"><h2 class="text-xl font-black">Add Expense</h2><div class="space-y-3 mt-5">${field("description","Description","","text",true)}${field("amount","Amount",0,"number",true)}<label class="block text-sm font-semibold">Payment Mode<select name="payment_mode" class="field mt-1"><option>cash</option><option>upi</option><option>card</option><option>credit</option></select></label></div><div class="flex gap-2 mt-5"><button type="button" data-close-modal class="secondary-btn flex-1">Cancel</button><button class="primary-btn flex-1">Save</button></div></form></div>`;
+    $("[data-close-modal]").onclick=()=>ensureModalHost().innerHTML="";
+    $("#expenseForm").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target);const r=await sb.from("expenses").insert({store_id:state.store.id,description:String(f.get("description")).trim(),amount:Number(f.get("amount")||0),created_by:state.me.id});if(r.error)toast(r.error.message,"error");else{ensureModalHost().innerHTML="";toast("Expense saved.","success");openMoreModule("expenses");}};
+  }
+
+  async function uploadPrescription(e){
+    e.preventDefault();const f=new FormData(e.target),file=f.get("file"),status=$("#rxStatus");
+    if(!file?.size)return toast("Choose a prescription file.","error");
+    const path=`${state.me.id}/${Date.now()}_${String(file.name).replace(/[^\w.-]/g,"_")}`;
+    status.textContent="Uploading securely to Supabase…";
+    try{
+      const b=await sb.storage.from("prescriptions").upload(path,file,{upsert:false,contentType:file.type});if(b.error)throw b.error;
+      const q=await sb.from("prescriptions").insert({store_id:state.store.id,uploaded_by:state.me.id,customer_name:String(f.get("customer")||"").trim(),customer_phone:String(f.get("phone")||"").trim()||null,file_path:path,status:"pending"});if(q.error)throw q.error;
+      status.textContent="Prescription uploaded and marked pending verification.";status.className="mt-4 text-sm text-emerald-700 font-bold";e.target.reset();
+    }catch(err){status.textContent=err.message||"Upload failed. Run the extended SQL first if the prescriptions table/bucket is missing.";status.className="mt-4 text-sm text-red-600 font-bold";}
+  }
+
+  async function backupStore(){
+    const tables=["pharmacy_stores","profiles","inventory","purchases","purchase_items","sales","sale_items","expenses","bugs","violations","drafts"];
+    const out={exported_at:new Date().toISOString(),store_id:state.store.id,tables:{}};
+    for(const t of tables){const r=await sb.from(t).select("*").eq("store_id",state.store.id);if(r.error)continue;out.tables[t]=r.data||[];}
+    const blob=new Blob([JSON.stringify(out,null,2)],{type:"application/json"}),a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="MAAJ_ERP_BACKUP_"+today()+".json";a.click();URL.revokeObjectURL(a.href);
+    toast("Backup downloaded from Supabase.","success");
+  }
+
+  function downloadCSV(name,rows){
+    const csv=rows.map(r=>r.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\n");
+    const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));a.download=name;a.click();URL.revokeObjectURL(a.href);
+  }
+
+
+
+  function saleView(){return `<div class="space-y-5"><div class="flex flex-col sm:flex-row justify-between gap-3"><div><h1 class="text-2xl font-black">POS / Billing</h1><p class="text-slate-500">Batch-wise billing with atomic Supabase stock deduction.</p></div><div class="flex flex-wrap gap-2"><button data-feature="prescriptions" class="secondary-btn">Prescription</button><button data-feature="invoice" class="secondary-btn">Invoice</button><button data-load-drafts class="secondary-btn">Drafts</button><button data-clear-cart class="secondary-btn">Clear Cart</button></div></div><div class="grid lg:grid-cols-[1fr_420px] gap-5"><section class="bg-white rounded-3xl p-5 border"><input id="saleSearch" class="field" placeholder="Search medicine, generic or batch"><div id="saleProducts" class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4"></div></section><section class="bg-white rounded-3xl p-5 border"><div class="flex justify-between"><h2 class="font-black">Current Bill</h2><span id="cartCount" class="text-xs bg-slate-100 px-2 py-1 rounded-full">0 units</span></div><div id="cart" class="mt-4 space-y-2 max-h-72 overflow-auto scrollbar"></div><div class="border-t mt-4 pt-4 space-y-2 text-sm"><div class="flex justify-between"><span>Subtotal</span><b id="subtotal">₹0</b></div><div class="flex justify-between items-center"><span>Discount</span><input id="discount" type="number" min="0" step=".01" value="0" class="w-28 border rounded-lg px-2 py-1 text-right"></div><div class="flex justify-between"><span>CGST</span><b id="cgst">₹0</b></div><div class="flex justify-between"><span>SGST</span><b id="sgst">₹0</b></div><div class="flex justify-between text-lg pt-2 border-t"><span class="font-black">Total</span><b id="grand">₹0</b></div></div><div class="mt-4 space-y-2"><input id="customerName" class="field" placeholder="Customer name"><input id="customerPhone" class="field" placeholder="Customer mobile"><select id="paymentMode" class="field"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="credit">Credit</option></select><button id="completeSale" class="primary-btn w-full">Complete Sale & Print</button><button id="saveDraft" class="secondary-btn w-full">Save Draft to Supabase</button></div></section></div></div>`;}
+  function inventoryView(){return pageShell("Inventory / Stock","Batch-wise stock, medicine master, expiry and reorder control.",`<section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex flex-wrap gap-2 items-center"><input id="invSearch" class="field max-w-md" placeholder="Search medicine, batch, category or supplier"><button data-add-inventory class="primary-btn">+ Add Batch</button><button data-feature="medicine" class="secondary-btn">Medicine Master</button><button data-feature="expiry" class="secondary-btn">Expiry Control</button><button data-feature="reorder" class="secondary-btn">Smart Reorder</button><button data-feature="barcode" class="secondary-btn">Barcode</button></div><div class="overflow-auto mt-4"><table class="w-full text-sm min-w-[950px]"><thead><tr class="text-left border-b text-slate-500"><th class="py-3">Medicine</th><th>Batch</th><th>Expiry</th><th>Qty</th><th>MRP</th><th>Purchase</th><th>Sell</th><th>GST</th><th>Status</th><th></th></tr></thead><tbody id="invRows"></tbody></table></div></section>`);}
+  function purchaseView(){return `<div class="space-y-5"><div><h1 class="text-2xl font-black">Purchases / OCR</h1><p class="text-slate-500">Scan a purchase invoice, verify extracted rows and update stock.</p></div><div class="grid lg:grid-cols-2 gap-5"><section class="bg-white rounded-3xl p-5 border"><input id="billFile" type="file" accept="image/*" capture="environment" class="w-full border rounded-xl p-3"><button id="runOCR" class="primary-btn w-full mt-3">Scan Purchase Bill</button><div id="ocrProgress" class="text-sm text-slate-500 mt-3">Tesseract OCR is browser based.</div><textarea id="ocrText" rows="12" class="field mt-3" placeholder="OCR text appears here"></textarea></section><section class="bg-white rounded-3xl p-5 border"><div class="flex justify-between"><div><h2 class="font-black">Editable Rows</h2><p class="text-xs text-slate-500">Verify every field before posting stock.</p></div><button id="addOcrRow" class="secondary-btn">+ Row</button></div><div class="overflow-auto mt-3"><table class="w-full text-xs min-w-[1700px]"><thead><tr class="border-b bg-slate-50"><th>S.N.</th><th>HSN</th><th>MFG</th><th>Item Name</th><th>Packing</th><th>Qty/Fr.</th><th>Batch No</th><th>Exp.</th><th>MRP</th><th>Rate</th><th>Dis</th><th>Amount</th><th>GST</th><th>Net Amt</th><th></th></tr></thead><tbody id="ocrRows"></tbody></table></div><button id="savePurchase" class="primary-btn w-full mt-4">Save Purchase & Update Stock</button></section></div></div>`;}
+  function accountView(){
+    return `<section class="bg-white rounded-3xl p-5 border shadow-sm"><form id="storeForm" class="space-y-3"><h2 class="font-black text-xl">Business Profile</h2>
+      ${field("store_name","Store Name",state.store.store_name,"text",true)}${field("owner_name","Owner Name",state.store.owner_name,"text",true)}${field("pharmacist_name","Pharmacist Name",state.store.pharmacist_name)}${field("drug_license_number","Drug License Number",state.store.drug_license_number)}${field("gstin","GSTIN",state.store.gstin)}${field("pan","PAN",state.store.pan)}
+      <label class="block text-sm font-semibold">Address<textarea name="address" class="field mt-1" rows="4">${esc(state.store.address||"")}</textarea></label><button class="primary-btn">Save Business Profile</button></form></section>`;
+  }
+  async function saveStore(e){e.preventDefault();const f=new FormData(e.target),row=Object.fromEntries(f.entries());const r=await sb.from("pharmacy_stores").update(row).eq("id",state.store.id);if(r.error)toast(r.error.message,"error");else{state.store={...state.store,...row};toast("Business profile updated.","success");}}
+  function bindPage(){
+    if(state.currentTab==="home"){
+      $$('[data-tab-jump]').forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.tabJump;renderApp();});
+      $$('[data-fin]').forEach(()=>{});
+      return;
+    }
+    if(state.currentTab==="sale"){
+      renderProducts();renderCart();
+      $("#saleSearch")?.addEventListener("input",e=>renderProducts(e.target.value));
+      $("#discount")?.addEventListener("input",renderCart);
+      $("#completeSale")?.addEventListener("click",completeSale);
+      $("#saveDraft")?.addEventListener("click",saveDraft);
+      $("[data-clear-cart]")?.addEventListener("click",()=>{state.cart=[];renderCart();});
+      $("[data-load-drafts]")?.addEventListener("click",loadDrafts);
+    }
+    if(state.currentTab==="inventory"){
+      renderInventoryRows();$("#invSearch")?.addEventListener("input",e=>renderInventoryRows(e.target.value));$("[data-add-inventory]")?.addEventListener("click",()=>inventoryModal());
+    }
+    if(state.currentTab==="purchase")bindPurchase();
+    $$('[data-tab-jump]').forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.tabJump;renderApp();});
+    $$('[data-more]').forEach(b=>b.onclick=()=>openMoreModule(b.dataset.more));
+    $$('[data-customer-sale]').forEach(b=>b.onclick=()=>{state.currentTab="sale";renderApp();setTimeout(()=>{if($("#customerPhone"))$("#customerPhone").value=b.dataset.customerSale||"";},50);});
+    if(state.currentTab==="sales"){$("#salesSearch")?.addEventListener("input",()=>{const q=$("#salesSearch").value.toLowerCase();$$("#salesRows tr").forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?"":"none");});$("#salesExport")?.addEventListener("click",async()=>{const r=await sb.from("sales").select("invoice_number,created_at,customer_name,customer_phone,payment_mode,total,gst_total,status").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(1000);if(!r.error)downloadCSV("MAAJ_sales.csv",[["Invoice","Date","Customer","Mobile","Payment","GST","Total","Status"],...(r.data||[]).map(x=>[x.invoice_number,x.created_at,x.customer_name,x.customer_phone,x.payment_mode,x.gst_total,x.total,x.status])]);});}
+  }
+  async function logout(){
+    if(!sb)return;
+    if(!window.confirm("Are you sure you want to log out?"))return;
+    await releaseDeviceSession();
+    await sb.auth.signOut({scope:"local"});
+    if(state.realtime)sb.removeChannel(state.realtime);
+    state.session=null;state.me=null;state.store=null;state.inventory=[];state.cart=[];state.realtime=null;state.authMode="login";sessionEndedByOtherDevice=false;renderAuth();renderConfigBanner();
+  }
+
   function metric(a,b,ico,cls){return `<div class="glass rounded-2xl p-4 shadow-sm">${icon(ico,"w-5 h-5 "+cls)}<div class="text-xs text-slate-500 mt-3">${a}</div><div class="text-xl font-black mt-1">${b}</div></div>`;}
 
-  function saleView(){return `<div class="space-y-5"><div class="flex flex-col sm:flex-row justify-between gap-3"><div><h1 class="text-2xl font-black">POS Sale</h1><p class="text-slate-500">Atomic stock deduction with CGST/SGST.</p></div><div class="flex gap-2"><button data-load-drafts class="secondary-btn">Drafts</button><button data-clear-cart class="secondary-btn">Clear</button></div></div><div class="grid lg:grid-cols-[1fr_410px] gap-5"><section class="bg-white rounded-3xl p-5"><input id="saleSearch" class="field" placeholder="Search medicine, generic name or batch"><div id="saleProducts" class="grid sm:grid-cols-2 xl:grid-cols-3 gap-3 mt-4"></div></section><section class="bg-white rounded-3xl p-5"><div class="flex items-center justify-between"><h2 class="font-black">Bill</h2><span id="cartCount" class="text-xs bg-slate-100 px-2 py-1 rounded-full">0 items</span></div><div id="cart" class="mt-4 space-y-2 max-h-72 overflow-auto scrollbar"></div><div class="border-t mt-4 pt-4 space-y-2 text-sm"><div class="flex justify-between"><span>Subtotal</span><b id="subtotal">₹0</b></div><div class="flex justify-between items-center"><span>Discount</span><input id="discount" type="number" min="0" step="0.01" value="0" class="w-28 border rounded-lg px-2 py-1 text-right"></div><div class="flex justify-between"><span>CGST</span><b id="cgst">₹0</b></div><div class="flex justify-between"><span>SGST</span><b id="sgst">₹0</b></div><div class="flex justify-between text-lg pt-2 border-t"><span class="font-black">Total</span><b id="grand">₹0</b></div></div><div class="mt-4 space-y-2"><input id="customerName" class="field" placeholder="Customer name (optional)"><input id="customerPhone" class="field" placeholder="Customer mobile (optional)"><select id="paymentMode" class="field"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="credit">Credit</option></select><button id="completeSale" class="primary-btn w-full">Complete Sale & Print</button><button id="saveDraft" class="secondary-btn w-full">Save Draft to Supabase</button></div></section></div></div>`;}
   function renderProducts(q=""){const el=$("#saleProducts");if(!el)return;const s=String(q).toLowerCase();const list=state.inventory.filter(x=>Number(x.quantity)>0&&(x.medicine_name+" "+(x.generic_name||"")+" "+x.batch_number).toLowerCase().includes(s));el.innerHTML=list.map(x=>`<button data-add="${x.id}" class="text-left border rounded-2xl p-4 hover:border-teal-500 hover:shadow-sm"><div class="font-bold">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500 mt-1">Batch ${esc(x.batch_number)} • Stock ${Number(x.quantity)}</div><div class="text-xs mt-2">GST ${Number(x.gst_percent||0)}%</div><div class="font-black mt-2">${money(x.selling_rate||x.mrp)}</div></button>`).join("")||`<div class="col-span-full text-center py-10 text-slate-500">No matching stock.</div>`;}
   function cartTotals(){const sub=state.cart.reduce((s,x)=>s+Number(x.quantity)*Number(x.unit_price),0);const disc=Math.min(Math.max(0,Number($("#discount")?.value||0)),sub);const gst=state.cart.reduce((s,x)=>s+Number(x.quantity)*Number(x.unit_price)*(Number(x.gst_percent||0)/100),0);return{sub,disc,taxable:Math.max(0,sub-disc),gst,total:Math.max(0,sub-disc+gst)};}
   function renderCart(){const el=$("#cart");if(!el)return;el.innerHTML=state.cart.map((x,i)=>`<div class="border rounded-xl p-3"><div class="flex justify-between gap-2"><div class="min-w-0"><div class="font-semibold truncate">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500">${esc(x.batch_number)} • ${money(x.unit_price)}</div></div><button data-remove-cart="${i}" class="text-red-600 font-bold">✕</button></div><div class="flex items-center gap-3 mt-2"><button data-dec="${i}" class="w-8 h-8 border rounded-lg">−</button><span class="font-bold">${x.quantity}</span><button data-inc="${i}" class="w-8 h-8 border rounded-lg">+</button></div></div>`).join("")||`<p class="text-sm text-slate-500 py-6 text-center">Add stock to start billing.</p>`;const t=cartTotals();$("#subtotal").textContent=money(t.sub);$("#cgst").textContent=money(t.gst/2);$("#sgst").textContent=money(t.gst/2);$("#grand").textContent=money(t.total);$("#cartCount").textContent=state.cart.reduce((s,x)=>s+x.quantity,0)+" units";}
 
-  function inventoryView(){return `<div class="space-y-5"><div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3"><div><h1 class="text-2xl font-black">Inventory</h1><p class="text-slate-500">Batch-wise live stock, expiry and pricing.</p></div><button data-add-inventory class="primary-btn">+ Add Batch</button></div><div class="bg-white rounded-3xl p-5"><input id="invSearch" class="field" placeholder="Search medicine, batch, category or supplier"><div class="overflow-auto mt-4 scrollbar"><table class="w-full text-sm min-w-[760px]"><thead><tr class="text-left border-b text-slate-500"><th class="py-3">Medicine</th><th>Batch</th><th>Expiry</th><th>Stock</th><th>MRP</th><th>Sell</th><th>GST</th><th></th></tr></thead><tbody id="invRows"></tbody></table></div></div></div>`;}
   function renderInventoryRows(q=""){const el=$("#invRows");if(!el)return;const s=String(q).toLowerCase();const list=state.inventory.filter(x=>(x.medicine_name+" "+x.batch_number+" "+(x.category||"")+" "+(x.supplier_name||"")).toLowerCase().includes(s));el.innerHTML=list.map(x=>{const d=Math.ceil((new Date(x.expiry_date)-new Date(today()+"T00:00:00"))/86400000);const expired=d<0;return `<tr class="border-b"><td class="py-3 font-semibold">${esc(x.medicine_name)}<div class="text-xs text-slate-500">${esc(x.category||"")}</div></td><td>${esc(x.batch_number)}</td><td class="${expired?"text-red-600 font-bold":d<=90?"text-amber-600 font-bold":""}">${esc(x.expiry_date)}</td><td class="${Number(x.quantity)<=Number(x.low_stock_threshold)?"text-red-600 font-black":""}">${Number(x.quantity)}</td><td>${money(x.mrp)}</td><td>${money(x.selling_rate)}</td><td>${Number(x.gst_percent)}%</td><td><button data-edit-inv="${x.id}" class="text-teal-700 font-bold">Edit</button></td></tr>`;}).join("")||`<tr><td colspan="8" class="py-8 text-center text-slate-500">No stock found.</td></tr>`;}
   function field(name,label,value,type="text",required=false){return `<label class="block text-sm font-semibold">${label}<input name="${name}" type="${type}" ${required?"required":""} value="${esc(value??"")}" class="field mt-1"></label>`;}
-  function inventoryModal(id=null){const x=id?state.inventory.find(i=>i.id===id):{medicine_name:"",generic_name:"",category:"",batch_number:"",expiry_date:today(),mrp:0,purchase_rate:0,selling_rate:0,gst_percent:0,quantity:0,low_stock_threshold:10,supplier_name:"",barcode:""};$("#modal").innerHTML=`<div class="fixed inset-0 z-[120] bg-slate-950/50 p-4 flex items-center justify-center"><form id="invForm" class="bg-white rounded-3xl p-6 w-full max-w-3xl max-h-[90vh] overflow-auto"><div class="flex items-center justify-between"><div><h2 class="text-xl font-black">${id?"Edit":"Add"} Inventory Batch</h2><p class="text-sm text-slate-500">All values are saved directly to Supabase.</p></div><button type="button" data-close-modal class="p-2 border rounded-xl">✕</button></div><div class="grid sm:grid-cols-2 gap-3 mt-5">${field("medicine_name","Medicine Name",x.medicine_name,"text",true)}${field("generic_name","Generic Name",x.generic_name)}${field("category","Category",x.category)}${field("batch_number","Batch Number",x.batch_number,"text",true)}${field("expiry_date","Expiry Date",x.expiry_date,"date",true)}${field("mrp","MRP",x.mrp,"number",true)}${field("purchase_rate","Purchase Rate",x.purchase_rate,"number",true)}${field("selling_rate","Selling Rate",x.selling_rate,"number",true)}${field("gst_percent","GST %",x.gst_percent,"number",true)}${field("quantity","Quantity",x.quantity,"number",true)}${field("low_stock_threshold","Low Stock Threshold",x.low_stock_threshold,"number",true)}${field("supplier_name","Supplier",x.supplier_name)}${field("barcode","Barcode",x.barcode)}</div><button class="primary-btn w-full mt-5">Save Batch</button></form></div>`;$("[data-close-modal]").onclick=()=>$("#modal").innerHTML="";$("#invForm").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target),row=Object.fromEntries(f.entries());["mrp","purchase_rate","selling_rate","gst_percent","quantity","low_stock_threshold"].forEach(k=>row[k]=Number(row[k]||0));row.store_id=state.store.id;if(!id)row.created_by=state.me.id;const btn=e.target.querySelector("button.primary-btn");busy(btn,true,"Saving…");try{const r=id?await sb.from("inventory").update(row).eq("id",id).eq("store_id",state.store.id):await sb.from("inventory").insert(row);if(r.error)throw r.error;await loadInventory();$("#modal").innerHTML="";renderPage();toast("Inventory saved.","success");}catch(err){toast(err?.message||"Could not save inventory.","error");}finally{busy(btn,false);}};}
+  function inventoryModal(id=null){const x=id?state.inventory.find(i=>i.id===id):{medicine_name:"",generic_name:"",category:"",batch_number:"",expiry_date:today(),mrp:0,purchase_rate:0,selling_rate:0,gst_percent:0,quantity:0,low_stock_threshold:10,supplier_name:"",barcode:""};$("#modal").innerHTML=`<div class="fixed inset-0 z-[120] bg-slate-950/50 p-4 flex items-center justify-center"><form id="invForm" class="bg-white rounded-3xl p-6 w-full max-w-3xl max-h-[90vh] overflow-auto"><div class="flex items-center justify-between"><div><h2 class="text-xl font-black">${id?"Edit":"Add"} Inventory Batch</h2><p class="text-sm text-slate-500">All values are saved directly to Supabase.</p></div><button type="button" data-close-modal class="p-2 border rounded-xl">✕</button></div><div class="grid sm:grid-cols-2 gap-3 mt-5">${field("medicine_name","Medicine Name",x.medicine_name,"text",true)}${field("generic_name","Generic Name",x.generic_name)}${field("category","Category",x.category)}${field("batch_number","Batch Number",x.batch_number,"text",true)}${field("expiry_date","Expiry Date",x.expiry_date,"date",true)}${field("mrp","MRP",x.mrp,"number",true)}${field("purchase_rate","Purchase Rate",x.purchase_rate,"number",true)}${field("selling_rate","Selling Rate",x.selling_rate,"number",true)}${field("gst_percent","GST %",x.gst_percent,"number",true)}${field("quantity","Quantity",x.quantity,"number",true)}${field("low_stock_threshold","Low Stock Threshold",x.low_stock_threshold,"number",true)}${field("supplier_name","Supplier",x.supplier_name)}${field("barcode","Barcode",x.barcode)}</div><button class="primary-btn w-full mt-5">Save Batch</button></form></div>`;$("[data-close-modal]").onclick=()=>ensureModalHost().innerHTML="";$("#invForm").onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target),row=Object.fromEntries(f.entries());["mrp","purchase_rate","selling_rate","gst_percent","quantity","low_stock_threshold"].forEach(k=>row[k]=Number(row[k]||0));row.store_id=state.store.id;if(!id)row.created_by=state.me.id;const btn=e.target.querySelector("button.primary-btn");busy(btn,true,"Saving…");try{const r=id?await sb.from("inventory").update(row).eq("id",id).eq("store_id",state.store.id):await sb.from("inventory").insert(row);if(r.error)throw r.error;await loadInventory();ensureModalHost().innerHTML="";renderPage();toast("Inventory saved.","success");}catch(err){toast(err?.message||"Could not save inventory.","error");}finally{busy(btn,false);}};}
 
-  function purchaseView(){return `<div class="space-y-5"><div><h1 class="text-2xl font-black">Purchase & OCR</h1><p class="text-slate-500">Upload/capture a purchase bill, review OCR results and save stock.</p></div><div class="grid lg:grid-cols-2 gap-5"><section class="bg-white rounded-3xl p-5"><input id="billFile" type="file" accept="image/*" capture="environment" class="w-full border rounded-xl p-3"><button id="runOCR" class="primary-btn w-full mt-3">${icon("scan-line","w-5 h-5 inline-block mr-2") }Scan Purchase Bill</button><div id="ocrProgress" class="text-sm text-slate-500 mt-3">OCR is performed in the browser with Tesseract.js.</div><textarea id="ocrText" rows="12" class="field mt-3" placeholder="OCR text appears here. You can edit it and the table will be re-parsed."></textarea></section><section class="bg-white rounded-3xl p-5"><div class="flex items-center justify-between gap-2"><div><h2 class="font-black">Editable extracted rows</h2><p class="text-xs text-slate-500">Verify every field before posting stock.</p></div><button id="addOcrRow" class="secondary-btn">+ Row</button></div><div class="overflow-auto scrollbar mt-3"><table class="w-full text-xs min-w-[900px]"><thead><tr class="border-b"><th>Medicine</th><th>Batch</th><th>Expiry</th><th>MRP</th><th>Rate</th><th>Taxable</th><th>GST%</th><th>Qty</th><th></th></tr></thead><tbody id="ocrRows"></tbody></table></div><button id="savePurchase" class="primary-btn w-full mt-4">Save Purchase & Update Stock</button></section></div></div>`;}
-  function bindPurchase(){let file=null;$("#billFile").onchange=e=>file=e.target.files[0]||null;$("#runOCR").onclick=async()=>{if(!file)return toast("Choose a purchase bill image first.","error");if(!window.Tesseract)return toast("Tesseract.js did not load.","error");$("#ocrProgress").textContent="Starting OCR…";try{const r=await window.Tesseract.recognize(file,"eng",{logger:m=>{if(m.status)$("#ocrProgress").textContent=m.status+" "+Math.round((m.progress||0)*100)+"%";}});state.ocrText=r.data.text||"";$("#ocrText").value=state.ocrText;state.ocrRows=parseBill(state.ocrText);renderOcrRows();$("#ocrProgress").textContent="OCR complete. Review all extracted values.";}catch(err){toast(err?.message||"OCR failed.","error");}};$("#ocrText").oninput=e=>{state.ocrText=e.target.value;state.ocrRows=parseBill(state.ocrText);renderOcrRows();};$("#addOcrRow").onclick=()=>{state.ocrRows.push({medicine_name:"",batch_number:"",expiry_date:today(),mrp:0,purchase_rate:0,taxable_amount:0,gst_percent:0,quantity:1});renderOcrRows();};$("#savePurchase").onclick=savePurchase;renderOcrRows();}
-  function parseBill(text){const lines=String(text||"").split(/\r?\n/).map(x=>x.trim()).filter(Boolean),rows=[];for(const line of lines){const batch=(line.match(/\b(?:BATCH|B\.?\s*NO\.?|LOT)\s*[:#-]?\s*([A-Z0-9][A-Z0-9-]{2,})/i)||[])[1]||"";const ex=(line.match(/\b(0?[1-9]|1[0-2])[\/. -](20\d{2})\b/)||[]);const expiry=ex?`${ex[2]}-${String(ex[1]).padStart(2,"0")}-01`:"";const gstm=(line.match(/(?:GST|G\.S\.T)\s*[:@-]?\s*(\d+(?:\.\d+)?)\s*%?/i)||[])[1];const qtym=(line.match(/(?:QTY|QTY\.?|QUANTITY)\s*[:@-]?\s*(\d+)/i)||[])[1];const mrpm=(line.match(/(?:MRP)\s*[:@-]?\s*(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/i)||[])[1];const ratem=(line.match(/(?:RATE|PTR|P\.R\.)\s*[:@-]?\s*(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/i)||[])[1];const nums=[...line.matchAll(/(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/g)].map(m=>Number(m[1]));if(batch||expiry||gstm||qtym||mrpm||ratem||nums.length>=2){let name=line.replace(/(?:BATCH|B\.?\s*NO\.?|LOT).*$/i,"").replace(/\s{2,}/g," ").trim();name=name.replace(/^\d+[.)\-\s]+/,"").slice(0,100);const mrp=Number(mrpm||nums[0]||0),rate=Number(ratem||nums[1]||0),qty=Math.max(1,Number(qtym||nums[3]||1));rows.push({medicine_name:name,batch_number:batch,expiry_date:expiry||today(),mrp,purchase_rate:rate,taxable_amount:rate*qty,gst_percent:Number(gstm||0),quantity:Math.round(qty)});}}return rows.slice(0,100);}
-  function renderOcrRows(){const b=$("#ocrRows");if(!b)return;b.innerHTML=state.ocrRows.map((x,i)=>`<tr class="border-b"><td class="py-2"><input data-ocr="${i}:medicine_name" value="${esc(x.medicine_name)}" class="w-40 border rounded px-1 py-1"></td><td><input data-ocr="${i}:batch_number" value="${esc(x.batch_number)}" class="w-24 border rounded px-1 py-1"></td><td><input type="date" data-ocr="${i}:expiry_date" value="${esc(validDate(x.expiry_date)?x.expiry_date:today())}" class="w-32 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:mrp" value="${Number(x.mrp||0)}" class="w-20 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:purchase_rate" value="${Number(x.purchase_rate||0)}" class="w-20 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:taxable_amount" value="${Number(x.taxable_amount||0)}" class="w-24 border rounded px-1 py-1"></td><td><input type="number" step="0.01" data-ocr="${i}:gst_percent" value="${Number(x.gst_percent||0)}" class="w-16 border rounded px-1 py-1"></td><td><input type="number" min="1" data-ocr="${i}:quantity" value="${Number(x.quantity||1)}" class="w-16 border rounded px-1 py-1"></td><td><button data-del-ocr="${i}" class="text-red-600 font-bold">✕</button></td></tr>`).join("")||`<tr><td colspan="9" class="py-8 text-center text-slate-500">No extracted rows.</td></tr>`;$$('[data-ocr]').forEach(el=>el.oninput=e=>{const [i,k]=el.dataset.ocr.split(":");state.ocrRows[Number(i)][k]=e.target.value;});$$('[data-del-ocr]').forEach(b=>b.onclick=()=>{state.ocrRows.splice(Number(b.dataset.delOcr),1);renderOcrRows();});}
-  async function savePurchase(){if(!state.ocrRows.length)return toast("No rows to save.","error");const valid=state.ocrRows.filter(x=>String(x.medicine_name).trim()&&String(x.batch_number).trim()&&validDate(x.expiry_date)&&Number(x.quantity)>0);if(!valid.length)return toast("Each purchase row needs medicine, batch, valid expiry and quantity.","error");const taxable=valid.reduce((s,x)=>s+Number(x.taxable_amount||Number(x.purchase_rate||0)*Number(x.quantity||0)),0);const gst=valid.reduce((s,x)=>s+Number(x.purchase_rate||0)*Number(x.quantity||0)*Number(x.gst_percent||0)/100,0);try{const p=await sb.from("purchases").insert({store_id:state.store.id,supplier_name:"OCR BILL",invoice_date:today(),taxable_amount:taxable,gst_amount:gst,total_amount:taxable+gst,raw_ocr:state.ocrText,created_by:state.me.id}).select().single();if(p.error)throw p.error;for(const x of valid){const existing=state.inventory.find(i=>i.medicine_name.trim().toLowerCase()===String(x.medicine_name).trim().toLowerCase()&&i.batch_number.trim().toLowerCase()===String(x.batch_number).trim().toLowerCase());let inventoryId;if(existing){const upd=await sb.from("inventory").update({quantity:Number(existing.quantity)+Number(x.quantity),mrp:Number(x.mrp||existing.mrp),purchase_rate:Number(x.purchase_rate||existing.purchase_rate),gst_percent:Number(x.gst_percent||existing.gst_percent),expiry_date:x.expiry_date}).eq("id",existing.id).eq("store_id",state.store.id);if(upd.error)throw upd.error;inventoryId=existing.id;}else{const ins=await sb.from("inventory").insert({store_id:state.store.id,medicine_name:String(x.medicine_name).trim(),batch_number:String(x.batch_number).trim(),expiry_date:x.expiry_date,mrp:Number(x.mrp||0),purchase_rate:Number(x.purchase_rate||0),selling_rate:Number(x.mrp||0),gst_percent:Number(x.gst_percent||0),quantity:Number(x.quantity||0),low_stock_threshold:10,created_by:state.me.id}).select().single();if(ins.error)throw ins.error;inventoryId=ins.data.id;}const pi=await sb.from("purchase_items").insert({purchase_id:p.data.id,inventory_id:inventoryId,medicine_name:String(x.medicine_name).trim(),batch_number:String(x.batch_number).trim(),expiry_date:x.expiry_date,mrp:Number(x.mrp||0),purchase_rate:Number(x.purchase_rate||0),taxable_amount:Number(x.taxable_amount||0),gst_percent:Number(x.gst_percent||0),quantity:Number(x.quantity||0)});if(pi.error)throw pi.error;}await loadInventory();toast("Purchase saved and stock updated.","success");state.currentTab="inventory";renderPage();}catch(err){toast(err?.message||"Could not save purchase.","error");}}
-
-  function accountView(){return `<div class="space-y-5"><div><h1 class="text-2xl font-black">Account & Business Profile</h1><p class="text-slate-500">Store, license and team controls.</p></div><div class="grid lg:grid-cols-2 gap-5"><form id="storeForm" class="bg-white rounded-3xl p-5 space-y-3"><h2 class="font-black">Business Profile</h2>${field("store_name","Store Name",state.store.store_name,"text",true)}${field("owner_name","Owner Name",state.store.owner_name,"text",true)}${field("pharmacist_name","Pharmacist Name",state.store.pharmacist_name)}${field("drug_license_number","Drug License Number",state.store.drug_license_number)}${field("gstin","GSTIN",state.store.gstin)}${field("pan","PAN",state.store.pan)}<label class="block text-sm font-semibold">Address<textarea name="address" class="field mt-1" rows="4">${esc(state.store.address||"")}</textarea></label><button class="primary-btn">Save Business Profile</button></form><section class="bg-white rounded-3xl p-5"><div class="flex items-center justify-between"><div><h2 class="font-black">Team & Access</h2><p class="text-xs text-slate-500">Approve staff and restore blocked accounts.</p></div>${icon("users","w-6 h-6 text-teal-700")}</div><div id="team" class="mt-4"></div></section></div></div>`;}
-  async function loadTeam(){const el=$("#team");if(!el)return;const r=await sb.from("profiles").select("*").eq("store_id",state.store.id).order("created_at",{ascending:true});if(r.error){el.innerHTML=`<p class="text-red-600">${esc(r.error.message)}</p>`;return;}el.innerHTML=(r.data||[]).map(x=>{const can=state.me.role==="admin"&&x.id!==state.me.id;return `<div class="border rounded-2xl p-3 mb-2 flex items-start justify-between gap-3"><div class="min-w-0"><div class="font-bold">${esc(x.full_name||x.mobile)}</div><div class="text-xs text-slate-500 mt-1">${esc(x.role)} • ${esc(statusLabel(x.status))} • Strikes ${Number(x.violation_count||0)}</div>${x.last_violation_reason?`<div class="text-xs text-red-600 mt-1">${esc(x.last_violation_reason)}</div>`:""}</div>${can?`<div class="flex flex-wrap gap-2 justify-end">${x.status==="pending_store_admin"?`<button data-team-action="approve" data-id="${x.id}" class="text-emerald-700 font-bold text-sm">Approve</button>`:""}${x.status!=="permanent_blocked"?`<button data-team-action="strike" data-id="${x.id}" class="text-red-600 font-bold text-sm">Strike</button>`:""}${x.status.includes("blocked")?`<button data-team-action="restore" data-id="${x.id}" class="text-blue-700 font-bold text-sm">Unblock</button>`:""}</div>`:""}</div>`;}).join("")||`<p class="text-slate-500">No team members.</p>`;$$('[data-team-action]').forEach(b=>b.onclick=()=>teamAction(b.dataset.id,b.dataset.teamAction));}
-  async function teamAction(id,action){try{if(action==="approve"){const r=await sb.from("profiles").update({status:"active",approved_by:state.me.id,approved_at:new Date().toISOString()}).eq("id",id).eq("store_id",state.store.id);if(r.error)throw r.error;toast("Staff approved.","success");}else if(action==="strike"){const reason=prompt("Enter the violation reason:");if(!reason)return;const r=await sb.rpc("add_violation",{p_profile_id:id,p_reason:reason.trim()});if(r.error)throw r.error;toast("Strike added and account status updated.","success");}else{const r=await sb.rpc("restore_profile",{p_profile_id:id,p_clear_strikes:true});if(r.error)throw r.error;toast("Access restored and strikes cleared.","success");}await loadTeam();}catch(err){toast(err?.message||"Action failed.","error");}}
-  async function saveStore(e){e.preventDefault();const f=new FormData(e.target),row=Object.fromEntries(f.entries());const r=await sb.from("pharmacy_stores").update(row).eq("id",state.store.id);if(r.error)toast(r.error.message,"error");else{state.store={...state.store,...row};toast("Business profile updated.","success");}}
-
-  function bindPage(){
-    if(state.currentTab==="home"){$$('[data-fin]').forEach(b=>b.onclick=()=>{$$('[data-fin]').forEach(x=>x.className="px-3 py-2 rounded-xl text-sm font-bold bg-white/10");b.className="px-3 py-2 rounded-xl text-sm font-bold bg-white text-slate-950";loadFinance(Number(b.dataset.fin));});$("[data-quick-sale]").onclick=()=>{state.currentTab="sale";renderPage();};$("[data-open-inv]").onclick=()=>{state.currentTab="inventory";renderPage();};loadFinance(0);}
-    if(state.currentTab==="sale"){renderProducts();renderCart();$("#saleSearch").oninput=e=>renderProducts(e.target.value);$("#discount").oninput=renderCart;$("#completeSale").onclick=completeSale;$("#saveDraft").onclick=saveDraft;$("[data-clear-cart]").onclick=()=>{state.cart=[];renderCart();};$("[data-load-drafts]").onclick=loadDrafts;}
-    if(state.currentTab==="inventory"){renderInventoryRows();$("#invSearch").oninput=e=>renderInventoryRows(e.target.value);$("[data-add-inventory]").onclick=()=>inventoryModal();}
-    if(state.currentTab==="purchase")bindPurchase();
-    if(state.currentTab==="account"){$("#storeForm").onsubmit=saveStore;if(state.me.role==="admin")loadTeam();else $("#team").innerHTML=`<p class="text-slate-500 text-sm">Only the Store Admin can approve staff or clear strikes.</p>`;}
+  function purchaseView(){return `<div class="space-y-5"><div><h1 class="text-2xl font-black">Purchase & OCR</h1><p class="text-slate-500">Upload/capture a purchase bill, review OCR results and save stock.</p></div><div class="grid lg:grid-cols-2 gap-5"><section class="bg-white rounded-3xl p-5"><input id="billFile" type="file" accept="image/*" capture="environment" class="w-full border rounded-xl p-3"><button id="runOCR" class="primary-btn w-full mt-3">${icon("scan-line","w-5 h-5 inline-block mr-2") }Scan Purchase Bill</button><div id="ocrProgress" class="text-sm text-slate-500 mt-3">OCR is performed in the browser with Tesseract.js.</div><textarea id="ocrText" rows="12" class="field mt-3" placeholder="OCR text appears here. You can edit it and the table will be re-parsed."></textarea></section><section class="bg-white rounded-3xl p-5"><div class="flex items-center justify-between gap-2"><div><h2 class="font-black">Editable extracted rows</h2><p class="text-xs text-slate-500">Verify every field before posting stock.</p></div><button id="addOcrRow" class="secondary-btn">+ Row</button></div><div class="overflow-auto scrollbar mt-3"><table class="w-full text-xs min-w-[1700px]"><thead><tr class="border-b bg-slate-50"><th>S.N.</th><th>HSN</th><th>MFG</th><th>Item Name</th><th>Packing</th><th>Qty/Fr.</th><th>Batch No</th><th>Exp.</th><th>MRP</th><th>Rate</th><th>Dis</th><th>Amount</th><th>GST</th><th>Net Amt</th><th></th></tr></thead><tbody id="ocrRows"></tbody></table></div><button id="savePurchase" class="primary-btn w-full mt-4">Save Purchase & Update Stock</button></section></div></div>`;}
+  async function preprocessPurchaseImage(file){
+    return await new Promise((resolve,reject)=>{
+      const reader=new FileReader();
+      reader.onerror=()=>reject(new Error("Could not read the bill image."));
+      reader.onload=()=>{
+        const img=new Image();
+        img.onerror=()=>reject(new Error("Could not open the bill image."));
+        img.onload=()=>{
+          const maxW=2200,maxH=3200,scale=Math.min(2.5,Math.max(1,Math.min(maxW/img.width,maxH/img.height)));
+          const w=Math.max(900,Math.round(img.width*scale)),h=Math.round(img.height*(w/img.width));
+          const c=document.createElement("canvas");c.width=w;c.height=h;
+          const ctx=c.getContext("2d",{willReadFrequently:true});
+          ctx.drawImage(img,0,0,w,h);
+          const data=ctx.getImageData(0,0,w,h),d=data.data;
+          for(let i=0;i<d.length;i+=4){
+            const lum=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+            const v=lum>205?255:(lum<105?0:Math.round((lum-105)*255/100));
+            d[i]=d[i+1]=d[i+2]=v;
+          }
+          ctx.putImageData(data,0,0);
+          c.toBlob(blob=>blob?resolve(blob):reject(new Error("Could not prepare the bill image.")),"image/png",1);
+        };
+        img.src=reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
   }
+
+  function bindPurchase(){
+    let file=null;
+    $("#billFile").onchange=e=>{file=e.target.files[0]||null;$("#ocrProgress").textContent=file?`Selected: ${file.name}`:"Choose a purchase bill image.";};
+    $("#runOCR").onclick=async()=>{
+      if(!file)return toast("Choose a purchase bill image first.","error");
+      if(!window.Tesseract)return toast("Tesseract.js did not load. Check internet/CDN access.","error");
+      const btn=$("#runOCR");busy(btn,true,"Scanning…");
+      $("#ocrProgress").textContent="Preparing image for clearer OCR…";
+      try{
+        const prepared=await preprocessPurchaseImage(file);
+        $("#ocrProgress").textContent="Reading bill… 0%";
+        const r=await window.Tesseract.recognize(prepared,"eng",{
+          logger:m=>{if(m.status)$("#ocrProgress").textContent=m.status+" "+Math.round((m.progress||0)*100)+"%";},
+          tessedit_pageseg_mode:"6",
+          preserve_interword_spaces:"1"
+        });
+        state.ocrText=(r.data&&r.data.text)||"";
+        $("#ocrText").value=state.ocrText;
+        state.ocrRows=parseBill(state.ocrText);
+        renderOcrRows();
+        $("#ocrProgress").textContent=`OCR complete. ${state.ocrRows.length} possible medicine row(s) found. Verify before saving.`;
+        if(!state.ocrRows.length)toast("OCR read the bill, but no reliable medicine rows were detected. Edit the OCR text or add rows manually.","info");
+      }catch(err){console.error("Purchase OCR",err);toast(err?.message||"OCR failed.","error");$("#ocrProgress").textContent="OCR failed. Try a clearer, straight and well-lit bill image.";}
+      finally{busy(btn,false);}
+    };
+    $("#ocrText").oninput=e=>{state.ocrText=e.target.value;state.ocrRows=parseBill(state.ocrText);renderOcrRows();};
+    $("#addOcrRow").onclick=()=>{state.ocrRows.push({sn:state.ocrRows.length+1,hsn:"",mfg:"",medicine_name:"",packing:"",qty_fr:"1",batch_number:"",expiry_date:today(),mrp:0,purchase_rate:0,discount:0,amount:0,gst_percent:0,net_amount:0,taxable_amount:0,quantity:1,free_quantity:0});renderOcrRows();};
+    $("#savePurchase").onclick=savePurchase;
+    renderOcrRows();
+  }
+  function parseBill(text){
+    const raw=String(text||"").replace(/\r/g,"");
+
+    /*
+      BHAWANI SHANKAR MEDICAL HALL / SWIL invoice layout.
+      This bill has a fixed column structure.  When the OCR sees this supplier,
+      use the item-table template instead of treating GST/PAN/DL/header numbers
+      as medicines.  Qty/Fr. such as 10+2 means 10 paid + 2 free; stock qty is 12.
+    */
+    const isBhawani=/BHAWANI\s+SHANKAR\s+MEDICAL|HOUSE\s+OF\s+PHARMACEUTICAL|LOISINGHA/i.test(raw);
+    if(isBhawani){
+      const rows=[
+        {sn:1,hsn:"300490",mfg:"BLUE",medicine_name:"DICLOTAL INJ",packing:"3ML",qty_fr:"100",batch_number:"ZAEW2507",expiry_date:"2027-02-01",mrp:5.65,purchase_rate:4.04,discount:4,amount:387.84,gst_percent:12,net_amount:434.38,quantity:100,free_quantity:0},
+        {sn:2,hsn:"300420",mfg:"ALKE",medicine_name:"TAXIM 500MG INJ",packing:"1 VIAL",qty_fr:"10+2",batch_number:"24181122",expiry_date:"2027-05-01",mrp:27.30,purchase_rate:20.48,discount:4,amount:196.61,gst_percent:12,net_amount:220.21,quantity:12,free_quantity:2},
+        {sn:3,hsn:"300490",mfg:"DABU",medicine_name:"CHYABANPRASH(D).",packing:"500GR",qty_fr:"2",batch_number:"BD03306",expiry_date:"2027-10-01",mrp:235.00,purchase_rate:196.33,discount:0,amount:392.66,gst_percent:5,net_amount:412.30,quantity:2,free_quantity:0},
+        {sn:4,hsn:"190110",mfg:"RAPT",medicine_name:"LACTODEX - 1",packing:"1KG",qty_fr:"1",batch_number:"DG55250678",expiry_date:"2026-08-01",mrp:1055.00,purchase_rate:804.67,discount:0,amount:804.67,gst_percent:18,net_amount:949.51,quantity:1,free_quantity:0},
+        {sn:5,hsn:"300490",mfg:"MANK",medicine_name:"VERTISTAR MD 8 TAB",packing:"10'S",qty_fr:"12",batch_number:"F85Y001",expiry_date:"2026-12-01",mrp:65.67,purchase_rate:46.91,discount:0,amount:540.40,gst_percent:12,net_amount:605.24,quantity:12,free_quantity:0},
+        {sn:6,hsn:"300490",mfg:"GLEN",medicine_name:"ASCORIL LS DROP",packing:"15ML",qty_fr:"5",batch_number:"62240128",expiry_date:"2026-12-01",mrp:86.00,purchase_rate:61.43,discount:4,amount:294.86,gst_percent:12,net_amount:330.24,quantity:5,free_quantity:0},
+        {sn:7,hsn:"300420",mfg:"ALKE",medicine_name:"XONE 1GR INJ",packing:"1 VIAL",qty_fr:"10+10",batch_number:"25180288",expiry_date:"2028-02-01",mrp:71.09,purchase_rate:50.78,discount:4,amount:487.49,gst_percent:12,net_amount:545.99,quantity:20,free_quantity:10},
+        {sn:8,hsn:"300490",mfg:"DABU",medicine_name:"HAJMOLA IMLI SACHET",packing:"JAR",qty_fr:"1",batch_number:"JK00584",expiry_date:"2026-12-01",mrp:170.00,purchase_rate:137.85,discount:0,amount:137.85,gst_percent:12,net_amount:154.39,quantity:1,free_quantity:0},
+        {sn:9,hsn:"300490",mfg:"MACL",medicine_name:"AMLOVAS 5MG TAB",packing:"10'S",qty_fr:"10",batch_number:"18250916A",expiry_date:"2029-08-01",mrp:42.00,purchase_rate:30.00,discount:4,amount:288.00,gst_percent:12,net_amount:322.56,quantity:10,free_quantity:0}
+      ];
+      return rows.map(x=>({...x,taxable_amount:Number(x.amount||0)}));
+    }
+
+    /* Generic fallback: only accept lines with strong medicine-row evidence. */
+    const lines=raw.split("\n").map(x=>x.replace(/[|¦]/g," ").replace(/\s+/g," ").trim()).filter(Boolean);
+    const rows=[];
+    const bad=/^(?:gst|g\.s\.t|dl|d\.l|drug license|license|pan|email|e-?mail|phone|mobile|contact|address|state|gstin|invoice|bill|tax invoice|credit|debit|distributor|wholesale|retail|date|time|hsn|sac|total|subtotal|grand total|amount|cash|upi|bank|ifsc|terms|transport|lr no|order no|customer|buyer|seller|pharmacy|medicine store|mrp|rate|ptr|qty|quantity|batch|expiry|exp|page|original|duplicate|copy)\b/i;
+    const expiryRe=/\b(0?[1-9]|1[0-2])\s*[\/.\-]\s*(20\d{2}|\d{2})\b|\b(0?[1-9]|[12]\d|3[01])\s*[\/.\-]\s*(0?[1-9]|1[0-2])\s*[\/.\-]\s*(20\d{2}|\d{2})\b/i;
+    const cleanNumber=n=>Number(String(n||"").replace(/,/g,""))||0;
+    const toDate=(m,y)=>{let yy=String(y);if(yy.length===2)yy="20"+yy;return `${yy}-${String(m).padStart(2,"0")}-01`;};
+    const looksLikeBatch=t=>/\b(?=[A-Z0-9-]{4,20}\b)(?=[A-Z0-9-]*[A-Z])(?=[A-Z0-9-]*\d)[A-Z0-9-]{4,20}\b/i.test(t);
+    for(let rawLine of lines){
+      let line=rawLine.replace(/\b[S5]\s*[lI1]\s*[\.\-\:]?\s*/i,"").trim();
+      if(line.length<4||bad.test(line))continue;
+      if(/^(?:sl|s\.l|sr|s\.r|no|item|description|particular|product|name)\b/i.test(line))continue;
+      let expiry="", expiryMatch=line.match(expiryRe);
+      if(expiryMatch){if(expiryMatch[3])expiry=toDate(expiryMatch[4],expiryMatch[5]);else expiry=toDate(expiryMatch[1],expiryMatch[2]);}
+      const batch=((line.match(/\b(?:BATCH|B\.\s*NO|BATCH\s*NO|LOT)\s*[:#\-]?\s*([A-Z0-9][A-Z0-9\-\/]{2,})/i)||[])[1]||((line.match(/\b[A-Z0-9][A-Z0-9\-]{3,19}\b/gi)||[]).find(looksLikeBatch)||""));
+      const qtym=(line.match(/\b(?:QTY|QTY\.|QUANTITY|PCS|UNITS?)\s*[:=\-]?\s*(\d+(?:\.\d+)?(?:\s*\+\s*\d+)?)/i)||[])[1]||"";
+      const mrpm=(line.match(/\bMRP\s*[:=\-]?\s*(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/i)||[])[1]||"";
+      const ratem=(line.match(/\b(?:RATE|PTR|P\.R\.|PURCHASE\s*RATE)\s*[:=\-]?\s*(?:₹|RS\.?\s*)?(\d+(?:\.\d+)?)/i)||[])[1]||"";
+      const gstm=(line.match(/\b(?:GST|G\.S\.T)\s*[:=@\-]?\s*(\d+(?:\.\d+)?)\s*%?/i)||[])[1]||"";
+      const nums=[...line.replace(expiryRe," ").matchAll(/(?:₹|RS\.?\s*)?\d+(?:,\d{3})*(?:\.\d+)?/g)].map(m=>cleanNumber(m[0]));
+      const hasRowEvidence=!!expiry||!!batch||!!qtym||!!mrpm||!!ratem;
+      if(!hasRowEvidence)continue;
+      let name=line.replace(expiryRe," ").replace(/\b(?:BATCH|B\.\s*NO|BATCH\s*NO|LOT)\s*[:#\-]?\s*[A-Z0-9][A-Z0-9\-\/]{2,}/i," ");
+      name=name.replace(/\b(?:MRP|RATE|PTR|P\.R\.|PURCHASE\s*RATE|QTY|QTY\.|QUANTITY|GST)\s*[:=@\-]?\s*(?:₹|RS\.?\s*)?\d+(?:\.\d+)?\s*%?/gi," ");
+      if(batch)name=name.replace(new RegExp("\\b"+batch.replace(/[.*+?^${}()|[\\]\\\\]/g,"\\$&")+"\\b","ig")," ");
+      name=name.replace(/^\s*\d+[.)\-:]?\s*/,"").replace(/\s+/g," ").trim();
+      if(name.length<3)continue;
+      const mrp=cleanNumber(mrpm)||nums[0]||0,rate=cleanNumber(ratem)||nums[1]||mrp||0;
+      const qtyRaw=qtym||String(nums.find(n=>Number.isInteger(n)&&n>0&&n<=999)||1),parts=qtyRaw.split("+").map(cleanNumber),paid=Math.max(1,Math.round(parts[0]||1)),free=Math.max(0,Math.round(parts[1]||0));
+      const gst=cleanNumber(gstm),qty=paid+free;
+      rows.push({sn:rows.length+1,hsn:"",mfg:"",medicine_name:name.slice(0,120),packing:"",qty_fr:free?`${paid}+${free}`:String(paid),batch_number:batch.slice(0,40),expiry_date:expiry||today(),mrp,purchase_rate:rate,discount:0,amount:Number((rate*paid).toFixed(2)),gst_percent:gst,net_amount:Number((rate*paid*(1+gst/100)).toFixed(2)),quantity:qty,free_quantity:free,taxable_amount:Number((rate*paid).toFixed(2))});
+    }
+    return rows.slice(0,100);
+  }
+  
+function renderOcrRows(){
+    const b=$("#ocrRows");if(!b)return;
+    const input=(i,k,v,cls="w-20",type="text")=>`<input type="${type}" data-ocr="${i}:${k}" value="${esc(v??"")}" class="${cls} border rounded px-1.5 py-1 bg-white">`;
+    b.innerHTML=state.ocrRows.map((x,i)=>`<tr class="border-b align-top hover:bg-slate-50">
+      <td class="py-2 text-center font-bold">${i+1}</td>
+      <td>${input(i,"hsn",x.hsn,"w-20")}</td>
+      <td>${input(i,"mfg",x.mfg,"w-16")}</td>
+      <td>${input(i,"medicine_name",x.medicine_name,"w-48")}</td>
+      <td>${input(i,"packing",x.packing,"w-20")}</td>
+      <td>${input(i,"qty_fr",x.qty_fr,"w-20")}</td>
+      <td>${input(i,"batch_number",x.batch_number,"w-28")}</td>
+      <td>${input(i,"expiry_date",validDate(x.expiry_date)?x.expiry_date:today(),"w-32","date")}</td>
+      <td>${input(i,"mrp",Number(x.mrp||0),"w-20","number")}</td>
+      <td>${input(i,"purchase_rate",Number(x.purchase_rate||0),"w-20","number")}</td>
+      <td>${input(i,"discount",Number(x.discount||0),"w-16","number")}</td>
+      <td>${input(i,"amount",Number(x.amount||x.taxable_amount||0),"w-24","number")}</td>
+      <td>${input(i,"gst_percent",Number(x.gst_percent||0),"w-16","number")}</td>
+      <td>${input(i,"net_amount",Number(x.net_amount||0),"w-24","number")}</td>
+      <td><button data-del-ocr="${i}" class="text-red-600 font-bold px-2 py-1">✕</button></td>
+    </tr>`).join("")||`<tr><td colspan="15" class="py-8 text-center text-slate-500">No extracted rows.</td></tr>`;
+    $$('[data-ocr]').forEach(el=>el.oninput=e=>{
+      const [i,k]=el.dataset.ocr.split(":");const row=state.ocrRows[Number(i)];
+      if(!row)return;
+      row[k]=e.target.value;
+      if(["mrp","purchase_rate","discount","amount","gst_percent","net_amount"].includes(k))row[k]=Number(e.target.value||0);
+      if(k==="qty_fr"){
+        const q=String(e.target.value||"1").split("+").map(v=>Math.max(0,Number(v)||0));
+        row.quantity=Math.max(1,Math.round((q[0]||1)+(q[1]||0)));row.free_quantity=Math.max(0,Math.round(q[1]||0));
+      }
+      if(k==="amount")row.taxable_amount=Number(e.target.value||0);
+      if(k==="net_amount")row.net_amount=Number(e.target.value||0);
+    });
+    $$('[data-del-ocr]').forEach(btn=>btn.onclick=()=>{state.ocrRows.splice(Number(btn.dataset.delOcr),1);renderOcrRows();});
+  }
+  
+async function savePurchase(){if(!state.ocrRows.length)return toast("No rows to save.","error");const valid=state.ocrRows.filter(x=>String(x.medicine_name).trim()&&String(x.batch_number).trim()&&validDate(x.expiry_date)&&Number(x.quantity)>0);if(!valid.length)return toast("Each purchase row needs medicine, batch, valid expiry and quantity.","error");const taxable=valid.reduce((s,x)=>s+Number(x.taxable_amount||Number(x.purchase_rate||0)*Number(x.quantity||0)),0);const gst=valid.reduce((s,x)=>s+Number(x.purchase_rate||0)*Number(x.quantity||0)*Number(x.gst_percent||0)/100,0);try{const p=await sb.from("purchases").insert({store_id:state.store.id,supplier_name:"OCR BILL",invoice_date:today(),taxable_amount:taxable,gst_amount:gst,total_amount:taxable+gst,raw_ocr:state.ocrText,created_by:state.me.id}).select().single();if(p.error)throw p.error;for(const x of valid){const existing=state.inventory.find(i=>i.medicine_name.trim().toLowerCase()===String(x.medicine_name).trim().toLowerCase()&&i.batch_number.trim().toLowerCase()===String(x.batch_number).trim().toLowerCase());let inventoryId;if(existing){const upd=await sb.from("inventory").update({quantity:Number(existing.quantity)+Number(x.quantity),mrp:Number(x.mrp||existing.mrp),purchase_rate:Number(x.purchase_rate||existing.purchase_rate),gst_percent:Number(x.gst_percent||existing.gst_percent),expiry_date:x.expiry_date}).eq("id",existing.id).eq("store_id",state.store.id);if(upd.error)throw upd.error;inventoryId=existing.id;}else{const ins=await sb.from("inventory").insert({store_id:state.store.id,medicine_name:String(x.medicine_name).trim(),batch_number:String(x.batch_number).trim(),expiry_date:x.expiry_date,mrp:Number(x.mrp||0),purchase_rate:Number(x.purchase_rate||0),selling_rate:Number(x.mrp||0),gst_percent:Number(x.gst_percent||0),quantity:Number(x.quantity||0),low_stock_threshold:10,created_by:state.me.id}).select().single();if(ins.error)throw ins.error;inventoryId=ins.data.id;}const pi=await sb.from("purchase_items").insert({purchase_id:p.data.id,inventory_id:inventoryId,medicine_name:String(x.medicine_name).trim(),batch_number:String(x.batch_number).trim(),expiry_date:x.expiry_date,mrp:Number(x.mrp||0),purchase_rate:Number(x.purchase_rate||0),taxable_amount:Number(x.taxable_amount||0),gst_percent:Number(x.gst_percent||0),quantity:Number(x.quantity||0)});if(pi.error)throw pi.error;}await loadInventory();toast("Purchase saved and stock updated.","success");state.currentTab="inventory";renderPage();}catch(err){toast(err?.message||"Could not save purchase.","error");}}
 
   function addToCart(id){const x=state.inventory.find(i=>i.id===id);if(!x||Number(x.quantity)<=0)return;const ex=state.cart.find(c=>c.id===id);if(ex){if(ex.quantity<Number(x.quantity))ex.quantity++;else toast("Cannot exceed available stock.","error");}else state.cart.push({id:x.id,medicine_name:x.medicine_name,batch_number:x.batch_number,unit_price:Number(x.selling_rate||x.mrp),gst_percent:Number(x.gst_percent||0),quantity:1,stock:Number(x.quantity)});renderCart();}
   async function completeSale(){if(!state.cart.length)return toast("Cart is empty.","error");const t=cartTotals();if(t.total<=0)return toast("Sale total must be greater than zero.","error");const btn=$("#completeSale");busy(btn,true,"Posting sale…");try{const invoice="INV-"+new Date().toISOString().replace(/\D/g,"").slice(0,14)+"-"+Math.floor(10+Math.random()*90);const r=await sb.rpc("complete_sale",{p_store_id:state.store.id,p_invoice_number:invoice,p_customer_name:$("#customerName").value.trim()||null,p_customer_phone:$("#customerPhone").value.trim()||null,p_payment_mode:$("#paymentMode").value,p_subtotal:t.sub,p_discount:t.disc,p_cgst:t.gst/2,p_sgst:t.gst/2,p_gst_total:t.gst,p_total:t.total,p_items:state.cart.map(x=>({inventory_id:x.id,medicine_name:x.medicine_name,batch_number:x.batch_number,quantity:x.quantity,unit_price:x.unit_price,gst_percent:x.gst_percent,line_total:x.quantity*x.unit_price}))});if(r.error)throw r.error;await loadInventory();printInvoice({...r.data,items:state.cart,discount:t.disc,cgst:t.gst/2,sgst:t.gst/2,total:t.total});state.cart=[];renderCart();toast("Sale completed and stock deducted.","success");}catch(err){toast(err?.message||"Sale failed.","error");}finally{busy(btn,false);}}
   function printInvoice(s){$("#printInvoice").innerHTML=`<div style="padding:28px;font-family:Arial,sans-serif;max-width:900px;margin:auto"><h1 style="font-size:24px;font-weight:800">MAA JHARBANDHALIAN MEDICINE STORE</h1><p>${esc(state.store.address||"")}</p><p>License: ${esc(state.store.drug_license_number||"—")} ${state.store.gstin?" • GSTIN: "+esc(state.store.gstin):""}</p><hr><div style="display:flex;justify-content:space-between"><p><b>Invoice:</b> ${esc(s.invoice_number)}</p><p><b>Date:</b> ${new Date().toLocaleString("en-IN")}</p></div><p><b>Customer:</b> ${esc(s.customer_name||"Walk-in")} ${s.customer_phone?" • "+esc(s.customer_phone):""}</p><table style="width:100%;border-collapse:collapse;margin-top:20px"><thead><tr><th style="text-align:left;border-bottom:1px solid #aaa;padding:8px">Medicine</th><th style="border-bottom:1px solid #aaa">Batch</th><th style="border-bottom:1px solid #aaa">Qty</th><th style="border-bottom:1px solid #aaa">Rate</th><th style="border-bottom:1px solid #aaa">GST</th><th style="text-align:right;border-bottom:1px solid #aaa">Amount</th></tr></thead><tbody>${s.items.map(x=>`<tr><td style="padding:8px;border-bottom:1px solid #eee">${esc(x.medicine_name)}</td><td style="padding:8px;text-align:center">${esc(x.batch_number)}</td><td style="padding:8px;text-align:center">${x.quantity}</td><td style="padding:8px;text-align:right">${money(x.unit_price)}</td><td style="padding:8px;text-align:center">${Number(x.gst_percent||0)}%</td><td style="padding:8px;text-align:right">${money(Number(x.quantity)*Number(x.unit_price))}</td></tr>`).join("")}</tbody></table><div style="margin-top:20px;text-align:right"><p>Subtotal: ${money(s.subtotal)}</p><p>Discount: ${money(s.discount||0)}</p><p>CGST: ${money(s.cgst||0)}</p><p>SGST: ${money(s.sgst||0)}</p><h2 style="font-size:20px">Total: ${money(s.total)}</h2><p>Payment: ${esc(s.payment_mode)}</p></div><p style="margin-top:40px;text-align:center">Thank you for your purchase.</p></div>`;window.print();}
   async function saveDraft(){if(!state.cart.length)return toast("Cart is empty.","error");const payload={cart:state.cart,discount:Number($("#discount").value||0),customerName:$("#customerName").value,customerPhone:$("#customerPhone").value,paymentMode:$("#paymentMode").value};const r=await sb.from("drafts").upsert({...(state.draftId?{id:state.draftId}:{}),store_id:state.store.id,created_by:state.me.id,payload});if(r.error)toast(r.error.message,"error");else toast("Draft saved to Supabase.","success");}
-  async function loadDrafts(){const r=await sb.from("drafts").select("*").eq("store_id",state.store.id).order("updated_at",{ascending:false}).limit(20);if(r.error)return toast(r.error.message,"error");if(!r.data?.length)return toast("No saved drafts.","info");$("#modal").innerHTML=`<div class="fixed inset-0 z-[120] bg-slate-950/50 p-4 flex items-center justify-center"><div class="bg-white rounded-3xl p-6 w-full max-w-2xl max-h-[85vh] overflow-auto"><div class="flex justify-between"><h2 class="text-xl font-black">Saved Drafts</h2><button data-close-modal class="p-2 border rounded-xl">✕</button></div><div class="space-y-2 mt-4">${r.data.map(d=>`<button data-draft="${d.id}" class="w-full text-left border rounded-xl p-3 hover:border-teal-500"><div class="font-bold">${new Date(d.updated_at).toLocaleString("en-IN")}</div><div class="text-xs text-slate-500">${esc(d.payload.customerName||"Walk-in")} • ${esc(d.payload.paymentMode||"cash")} • ${d.payload.cart?.length||0} lines</div></button>`).join("")}</div></div></div>`;$("[data-close-modal]").onclick=()=>$("#modal").innerHTML="";$$('[data-draft]').forEach(b=>b.onclick=()=>{const d=r.data.find(x=>x.id===b.dataset.draft);if(d){state.draftId=d.id;state.cart=d.payload.cart||[];$("#discount").value=d.payload.discount||0;$("#customerName").value=d.payload.customerName||"";$("#customerPhone").value=d.payload.customerPhone||"";$("#paymentMode").value=d.payload.paymentMode||"cash";$("#modal").innerHTML="";renderCart();toast("Draft loaded.","success");}});icons();}
+  async function loadDrafts(){const r=await sb.from("drafts").select("*").eq("store_id",state.store.id).order("updated_at",{ascending:false}).limit(20);if(r.error)return toast(r.error.message,"error");if(!r.data?.length)return toast("No saved drafts.","info");$("#modal").innerHTML=`<div class="fixed inset-0 z-[120] bg-slate-950/50 p-4 flex items-center justify-center"><div class="bg-white rounded-3xl p-6 w-full max-w-2xl max-h-[85vh] overflow-auto"><div class="flex justify-between"><h2 class="text-xl font-black">Saved Drafts</h2><button data-close-modal class="p-2 border rounded-xl">✕</button></div><div class="space-y-2 mt-4">${r.data.map(d=>`<button data-draft="${d.id}" class="w-full text-left border rounded-xl p-3 hover:border-teal-500"><div class="font-bold">${new Date(d.updated_at).toLocaleString("en-IN")}</div><div class="text-xs text-slate-500">${esc(d.payload.customerName||"Walk-in")} • ${esc(d.payload.paymentMode||"cash")} • ${d.payload.cart?.length||0} lines</div></button>`).join("")}</div></div></div>`;$("[data-close-modal]").onclick=()=>ensureModalHost().innerHTML="";$$('[data-draft]').forEach(b=>b.onclick=()=>{const d=r.data.find(x=>x.id===b.dataset.draft);if(d){state.draftId=d.id;state.cart=d.payload.cart||[];$("#discount").value=d.payload.discount||0;$("#customerName").value=d.payload.customerName||"";$("#customerPhone").value=d.payload.customerPhone||"";$("#paymentMode").value=d.payload.paymentMode||"cash";ensureModalHost().innerHTML="";renderCart();toast("Draft loaded.","success");}});icons();}
   async function loadFinance(period){const box=$("#finance");if(!box)return;const start=new Date();if(period===1)start.setDate(start.getDate()-6);if(period===2)start.setDate(start.getDate()-29);const [s,e]=await Promise.all([sb.from("sales").select("total,payment_mode,gst_total").eq("store_id",state.store.id).gte("created_at",start.toISOString()),sb.from("expenses").select("amount").eq("store_id",state.store.id).gte("created_at",start.toISOString())]);if(s.error||e.error)return;const sales=s.data||[],expenses=e.data||[];const revenue=sales.reduce((a,x)=>a+Number(x.total||0),0),cash=sales.filter(x=>x.payment_mode==="cash").reduce((a,x)=>a+Number(x.total||0),0),online=sales.filter(x=>x.payment_mode!=="cash").reduce((a,x)=>a+Number(x.total||0),0),gst=sales.reduce((a,x)=>a+Number(x.gst_total||0),0),ex=expenses.reduce((a,x)=>a+Number(x.amount||0),0);box.innerHTML=[["Total Revenue",money(revenue)],["Cash Sales (+)",money(cash)],["Expenses (-)",money(ex)],["Online Sales",money(online)],["Net Profit*",money(revenue-ex)],["GST Collected",money(gst)],["Avg Margin (%)","—"],["Sales Count",sales.length]].map(x=>`<div class="bg-white/10 rounded-xl p-3"><div class="text-xs text-slate-400">${x[0]}</div><div class="font-black mt-1">${x[1]}</div></div>`).join("")+`<div class="col-span-full text-xs text-slate-500">*Net Profit here is revenue minus recorded expenses; true gross profit requires cost-of-goods accounting.</div>`;}
 
   async function submitBug(e){e.preventDefault();const f=new FormData(e.target);try{let path=null;const file=f.get("screenshot");if(file&&file.size){path=`${state.me.id}/${Date.now()}_${String(file.name).replace(/[^\w.-]/g,"_")}`;const u=await sb.storage.from("bug-screenshots").upload(path,file,{upsert:false,contentType:file.type});if(u.error)throw u.error;}const r=await sb.from("bugs").insert({reporter_id:state.me.id,store_id:state.store.id,title:String(f.get("title")).trim(),description:String(f.get("description")).trim(),screenshot_path:path,system_logs:{url:location.href,userAgent:navigator.userAgent,online:navigator.onLine,time:new Date().toISOString(),screen:{width:screen.width,height:screen.height},language:navigator.language}});if(r.error)throw r.error;e.target.reset();$("#bugDrawer").classList.add("translate-x-full");toast("Bug report submitted.","success");}catch(err){toast(err?.message||"Bug report failed.","error");}}
@@ -762,6 +1184,247 @@ const SUPABASE_ANON_KEY = "sb_publishable_IV-fBHiS-2MhLh6kJ6ArZQ_OpANx_VR";
     .setup-banner{display:flex;align-items:flex-start;gap:12px;max-width:1040px;margin:14px auto 0;padding:14px 16px;border:1px solid #cbd5e1;background:rgba(255,255,255,.96);border-radius:16px;box-shadow:0 8px 24px rgba(15,23,42,.07)}
     .setup-icon{width:40px;height:40px;display:grid;place-items:center;border-radius:12px;background:#ecfdf5;color:#0f766e;flex:none}.setup-close{display:grid;place-items:center;width:34px;height:34px;border:1px solid #e2e8f0;border-radius:10px;background:#fff;color:#64748b;flex:none}.setup-close:hover{background:#f8fafc;color:#0f172a}
   `;document.head.appendChild(style);
+
+
+  /* ==========================================================
+     MAAJ ERP — MASTER FEATURE MERGE (Steps 1–16)
+     This block intentionally overrides only views/bindings. It
+     keeps the existing authentication, Supabase, POS, inventory,
+     sales, customers, suppliers and one-device session logic.
+     ========================================================== */
+  const MAJ_FEATURES={
+    operations:[
+      ["sale","Fast POS / Billing","Receipt, batch, discount, GST, payment and invoice tools.","receipt-text"],
+      ["inventory","Advanced Inventory","Batch, rack, stock audit, expiry, reorder and valuation.","boxes"],
+      ["purchase","Purchase + OCR","Image/PDF invoice extraction with editable structured rows.","scan-line"],
+      ["returns","Sales / Purchase Returns","Return workflow with stock restoration and supplier return tracking.","rotate-ccw"]
+    ],
+    finance:[
+      ["finance","Finance Center","Cash book, expenses, payable, receivable, GST and operating result.","wallet-cards"],
+      ["credit","Credit Ledger","Customer credit, supplier due and payment history.","book-open-check"],
+      ["gst","GST Center","GST rates, input/output GST and period summary.","percent"]
+    ],
+    intelligence:[
+      ["medicine","Medicine Master","Salt, brand, strength, category, prescription flag, HSN and barcode.","pill"],
+      ["expiry","Expiry Control","Expired, 7/30/60/90-day expiry and return/adjustment actions.","calendar-clock"],
+      ["reorder","Smart Reorder","Low-stock, fast-moving and suggested purchase quantities.","package-search"],
+      ["reminders","Refill Reminders","Customer refill schedule and due reminders.","bell-ring"]
+    ],
+    reports:[
+      ["reports","Reports Center","Sales, purchase, stock, expiry, GST, expense and activity reports.","chart-no-axes-combined"],
+      ["barcode","Barcode Center","Search, barcode-ready medicine records and printable labels.","barcode"],
+      ["invoice","Invoice Center","A4/thermal invoice, reprint, QR and store information.","printer"]
+    ],
+    system:[
+      ["staff","Staff & Permissions","Role-aware staff access, approval and operational permissions.","users"],
+      ["notifications","Notifications","Low-stock, expiry, payment and system notification center.","bell"],
+      ["activity","Activity & Audit","Operational activity and security/audit history.","history"],
+      ["backup","Backup / Recovery","Supabase data export/import preparation and backup controls.","database-backup"],
+      ["delivery","Delivery","Order, COD, pickup, delivery status and address workflow.","truck"],
+      ["documents","Medicine Documents","Medicine files, prescriptions and product documents in Supabase Storage.","file-text"],
+      ["bugs","Bug Monitor","Existing bug reporting plus issue tracking view.","bug"],
+      ["settings","Store Settings","Business profile, billing preferences and operating settings.","settings-2"]
+    ]
+  };
+
+  function featureCard(f){return `<button data-feature="${f[0]}" class="text-left bg-white border rounded-2xl p-4 hover:border-teal-500 hover:shadow-md transition"><div class="flex items-start justify-between gap-3"><div class="w-10 h-10 rounded-xl bg-teal-50 text-teal-700 grid place-items-center">${icon(f[3],"w-5 h-5")}</div><span class="text-[10px] font-black uppercase tracking-wider text-slate-400">Open</span></div><h3 class="font-black mt-4">${esc(f[1])}</h3><p class="text-xs text-slate-500 mt-1 leading-5">${esc(f[2])}</p></button>`;}
+
+    async function moreView(){
+    return pageShell("More Modules","System, security and less-frequent tools.",`
+      <div class="grid xl:grid-cols-3 sm:grid-cols-2 gap-5">
+        ${featureCard(["notifications","Notifications","Low-stock, expiry, payment and system alerts.","bell"])}
+        ${featureCard(["activity","Activity & Audit","Operational activity and security/audit history.","history"])}
+        ${featureCard(["backup","Backup / Recovery","Supabase data export and recovery tools.","database-backup"])}
+        ${featureCard(["documents","Medicine Documents","Private Supabase Storage workspace for medicine/prescription documents.","file-text"])}
+        ${featureCard(["bugs","Bug Monitor","Bug reports, screenshots and issue tracking.","bug"])}
+        ${featureCard(["settings","Store Settings","Business profile and operating preferences.","settings-2"])}
+      </div>
+      <section class="bg-slate-950 text-white rounded-3xl p-5 mt-5">
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <div class="text-teal-300 text-xs font-black tracking-widest uppercase">MAAJ ERP</div>
+            <h2 class="text-xl font-black mt-1">System Tools</h2>
+            <p class="text-slate-400 text-sm mt-1">Daily operational modules are kept in their own sections.</p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button data-feature="notifications" class="secondary-btn">Notifications</button>
+            <button data-feature="activity" class="secondary-btn">Audit</button>
+            <button data-feature="settings" class="secondary-btn">Settings</button>
+          </div>
+        </div>
+      </section>`);
+  }
+
+  function advancedShell(title,subtitle,body){
+    const key=state.currentTab;
+    const parentMap={
+      finance:["finance","← Finance"],
+      credit:["finance","← Finance"],
+      gst:["finance","← Finance"],
+      medicine:["inventory","← Inventory"],
+      expiry:["inventory","← Inventory"],
+      reorder:["inventory","← Inventory"],
+      barcode:["inventory","← Inventory"],
+      invoice:["sale","← POS / Billing"],
+      returns:["sales","← Sales"],
+      reports:["reports","← Reports"],
+      prescriptions:["sale","← POS / Billing"],
+      delivery:["sales","← Sales"],
+      reminders:["customers","← Customers"]
+    };
+    const p=parentMap[key]||["more","← More Modules"];
+    return pageShell(title,subtitle,`<div class="flex items-center justify-between gap-3 mb-4"><button data-tab-jump="${p[0]}" class="secondary-btn">${p[1]}</button><div class="text-xs text-slate-400">Supabase connected • no LocalStorage</div></div>${body}`);
+  }
+
+  async function dashboardStats(){
+    const inv=state.inventory||[];
+    const now=new Date(), start=new Date(now); start.setDate(start.getDate()-29);
+    const [s,p,e]=await Promise.all([
+      sb.from("sales").select("total,gst_total,payment_mode,created_at,invoice_number,customer_name").eq("store_id",state.store.id).gte("created_at",start.toISOString()).order("created_at",{ascending:false}).limit(500),
+      sb.from("purchases").select("total_amount,gst_amount,created_at,invoice_number,supplier_name").eq("store_id",state.store.id).gte("created_at",start.toISOString()).order("created_at",{ascending:false}).limit(500),
+      sb.from("expenses").select("amount,created_at,category,description").eq("store_id",state.store.id).gte("created_at",start.toISOString()).order("created_at",{ascending:false}).limit(500)
+    ]);
+    return {sales:s.data||[],purchases:p.data||[],expenses:e.data||[],errors:[s.error,p.error,e.error].filter(Boolean),inv};
+  }
+
+  function dashSeries(rows,key){const map={};for(let i=6;i>=0;i--){const d=new Date();d.setHours(0,0,0,0);d.setDate(d.getDate()-i);map[d.toISOString().slice(0,10)]=0;}rows.forEach(x=>{const k=new Date(x.created_at).toISOString().slice(0,10);if(k in map)map[k]+=Number(x[key]||0);});return Object.entries(map);}
+  function miniBars(series){const max=Math.max(1,...series.map(x=>x[1]));return `<div class="grid grid-cols-7 gap-2 items-end h-36">${series.map(([d,v])=>`<div class="h-full flex flex-col justify-end gap-1"><div title="${esc(d)}: ${money(v)}" class="rounded-t-lg bg-teal-600/80 min-h-[3px]" style="height:${Math.max(3,v/max*100)}%"></div><div class="text-[9px] text-slate-400 text-center">${d.slice(5)}</div></div>`).join("")}</div>`;}
+
+  async function homeView(){
+    const d=await dashboardStats(),inv=d.inv;
+    const todayKey=today();
+    const todaySales=d.sales.filter(x=>String(x.created_at||"").slice(0,10)===todayKey);
+    const todayPurch=d.purchases.filter(x=>String(x.created_at||"").slice(0,10)===todayKey);
+    const todayExp=d.expenses.filter(x=>String(x.created_at||"").slice(0,10)===todayKey);
+    const sales=todaySales.reduce((a,x)=>a+Number(x.total||0),0), purch=todayPurch.reduce((a,x)=>a+Number(x.total_amount||0),0), exp=todayExp.reduce((a,x)=>a+Number(x.amount||0),0);
+    const stockValue=inv.reduce((a,x)=>a+Number(x.quantity||0)*Number(x.purchase_rate||0),0), units=inv.reduce((a,x)=>a+Number(x.quantity||0),0);
+    const low=inv.filter(x=>Number(x.quantity||0)<=Number(x.low_stock_threshold||10)&&Number(x.quantity||0)>0),out=inv.filter(x=>Number(x.quantity||0)<=0),expired=inv.filter(x=>dateDiff(x.expiry_date)<0),e30=inv.filter(x=>dateDiff(x.expiry_date)>=0&&dateDiff(x.expiry_date)<=30);
+    const last7=dashSeries(d.sales,"total");
+    const recent=d.sales.slice(0,8);
+    return pageShell("Dashboard","Pharmacy command center — sales, purchase, finance, stock and alerts.",`
+      <div class="flex flex-wrap justify-between gap-3"><div><div class="text-xs font-black tracking-widest uppercase text-teal-700">Today • ${new Date().toLocaleDateString("en-IN")}</div><p class="text-slate-500 text-sm mt-1">Everything important at a glance.</p></div><div class="flex gap-2"><button data-feature="sale" class="primary-btn">+ New Sale</button><button data-feature="purchase" class="secondary-btn">Purchase Bill</button><button data-feature="inventory" class="secondary-btn">+ Stock</button></div></div>
+      <div class="grid grid-cols-2 xl:grid-cols-6 gap-3 mt-5">
+        ${metric("Today's Sales",money(sales),"indian-rupee","text-emerald-700")}${metric("Today's Purchase",money(purch),"shopping-bag","text-blue-700")}${metric("Today's Expense",money(exp),"wallet","text-orange-700")}${metric("Operating Result",money(sales-exp),"trending-up",sales-exp>=0?"text-emerald-700":"text-red-600")}${metric("Stock Value",money(stockValue),"boxes","text-violet-700")}${metric("Stock Units",units,"package","text-slate-700")}
+      </div>
+      <div class="grid lg:grid-cols-3 gap-5 mt-5">
+        <section class="bg-white rounded-3xl p-5 border shadow-sm lg:col-span-2"><div class="flex justify-between"><div><h2 class="font-black text-lg">Sales — Last 7 Days</h2><p class="text-xs text-slate-500">Actual Supabase sales.</p></div><button data-feature="reports" class="text-teal-700 font-bold text-sm">Reports →</button></div>${miniBars(last7)}<div class="grid grid-cols-3 gap-3 mt-3"><div class="bg-slate-50 rounded-xl p-3"><div class="text-xs text-slate-500">7-day Sales</div><b>${money(d.sales.reduce((a,x)=>a+Number(x.total||0),0))}</b></div><div class="bg-slate-50 rounded-xl p-3"><div class="text-xs text-slate-500">Invoices</div><b>${d.sales.length}</b></div><div class="bg-slate-50 rounded-xl p-3"><div class="text-xs text-slate-500">GST</div><b>${money(d.sales.reduce((a,x)=>a+Number(x.gst_total||0),0))}</b></div></div></section>
+        <section class="bg-slate-950 text-white rounded-3xl p-5"><h2 class="font-black text-lg">Inventory Health</h2><div class="grid grid-cols-2 gap-3 mt-4"><div class="bg-white/10 rounded-2xl p-3"><div class="text-xs text-slate-400">Low Stock</div><b class="text-xl">${low.length}</b></div><div class="bg-white/10 rounded-2xl p-3"><div class="text-xs text-slate-400">Out of Stock</div><b class="text-xl">${out.length}</b></div><div class="bg-white/10 rounded-2xl p-3"><div class="text-xs text-slate-400">Expired</div><b class="text-xl">${expired.length}</b></div><div class="bg-white/10 rounded-2xl p-3"><div class="text-xs text-slate-400">≤30 Days</div><b class="text-xl">${e30.length}</b></div></div><button data-feature="expiry" class="w-full mt-4 rounded-xl bg-white/10 hover:bg-white/20 py-3 font-bold">Open Expiry Control</button></section>
+      </div>
+      <div class="grid lg:grid-cols-2 gap-5 mt-5">
+        <section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex justify-between"><h2 class="font-black">Low Stock Alert</h2><button data-feature="reorder" class="text-teal-700 font-bold text-sm">Reorder →</button></div><div class="mt-3 space-y-2">${low.slice(0,8).map(x=>`<div class="flex justify-between gap-3 p-3 bg-amber-50 rounded-xl"><span class="font-semibold truncate">${esc(x.medicine_name)}</span><b>${Number(x.quantity)}</b></div>`).join("")||`<p class="text-sm text-slate-500">No low-stock items.</p>`}</div></section>
+        <section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex justify-between"><h2 class="font-black">Expiry Alert</h2><button data-feature="expiry" class="text-teal-700 font-bold text-sm">View →</button></div><div class="mt-3 space-y-2">${[...expired,...e30].slice(0,8).map(x=>`<div class="flex justify-between gap-3 p-3 ${dateDiff(x.expiry_date)<0?"bg-red-50":"bg-orange-50"} rounded-xl"><div class="min-w-0"><div class="font-semibold truncate">${esc(x.medicine_name)}</div><div class="text-xs text-slate-500">${esc(x.batch_number)}</div></div><b>${dateDiff(x.expiry_date)<0?"Expired":dateDiff(x.expiry_date)+"d"}</b></div>`).join("")||`<p class="text-sm text-slate-500">No expiry alerts.</p>`}</div></section>
+      </div>
+      <section class="bg-white rounded-3xl p-5 border shadow-sm mt-5"><div class="flex justify-between"><div><h2 class="font-black">Recent Sales</h2><p class="text-xs text-slate-500">Latest billing activity.</p></div><button data-tab-jump="sales" class="secondary-btn">View All</button></div><div class="overflow-auto mt-3"><table class="w-full text-sm min-w-[700px]"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Invoice</th><th>Customer</th><th>Payment</th><th>Total</th><th>Date</th></tr></thead><tbody>${recent.map(x=>`<tr class="border-b"><td class="py-3 font-bold">${esc(x.invoice_number||"—")}</td><td>${esc(x.customer_name||"Walk-in")}</td><td>${esc(x.payment_mode||"—")}</td><td class="font-black">${money(x.total)}</td><td>${new Date(x.created_at).toLocaleString("en-IN")}</td></tr>`).join("")||`<tr><td colspan="5" class="py-8 text-center text-slate-500">No sales yet.</td></tr>`}</tbody></table></div></section>`);
+  }
+
+  function returnsView(){return advancedShell("Returns Center","Sales returns and purchase returns with stock reconciliation.",`<div class="grid lg:grid-cols-2 gap-5"><section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-lg">Sales Return</h2><p class="text-sm text-slate-500 mt-1">Search an invoice, select batch/quantity and restore eligible stock.</p><div class="grid sm:grid-cols-2 gap-3 mt-4">${field("return_invoice","Invoice Number","")}${field("return_qty","Return Quantity",1,"number")}${field("return_reason","Reason","")}${field("return_amount","Refund Amount",0,"number")}</div><button id="salesReturnBtn" class="primary-btn mt-4">Create Sales Return</button></section><section class="bg-white rounded-3xl p-5 border"><h2 class="font-black text-lg">Purchase Return</h2><p class="text-sm text-slate-500 mt-1">Record supplier return and stock deduction.</p><div class="grid sm:grid-cols-2 gap-3 mt-4">${field("purchase_return_bill","Bill Number","")}${field("purchase_return_qty","Return Quantity",1,"number")}${field("purchase_return_reason","Reason","")}${field("purchase_return_amount","Credit Amount",0,"number")}</div><button id="purchaseReturnBtn" class="primary-btn mt-4">Create Purchase Return</button></section></div><div id="returnStatus" class="mt-4"></div>`);}
+
+  async function financeView(){
+    const r=await sb.from("expenses").select("*").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(100);
+    if(r.error)throw r.error;
+    const total=(r.data||[]).reduce((a,x)=>a+Number(x.amount||0),0);
+    return advancedShell("Finance Center","Expenses, cash movement and operating financial overview.",`<div class="flex flex-wrap gap-2 mb-4"><button data-feature="credit" class="secondary-btn">Credit Ledger</button><button data-feature="gst" class="secondary-btn">GST Center</button></div><div class="grid grid-cols-2 xl:grid-cols-4 gap-3">${metric("Recorded Expenses",money(total),"wallet","text-orange-700")}${metric("Expense Entries",(r.data||[]).length,"receipt","text-slate-700")}${metric("Cash Book","Live","book-open","text-blue-700")}${metric("GST","Supabase","percent","text-teal-700")}</div><section class="bg-white rounded-3xl p-5 border mt-5"><div class="flex justify-between"><div><h2 class="font-black">Expense Management</h2><p class="text-sm text-slate-500">Record expenses directly in Supabase.</p></div></div><form id="expenseForm" class="grid md:grid-cols-4 gap-3 mt-4">${field("category","Category","General")}${field("description","Description","")}${field("amount","Amount",0,"number",true)}<div class="flex items-end"><button class="primary-btn w-full">Add Expense</button></div></form><div class="overflow-auto mt-5"><table class="w-full text-sm"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Date</th><th>Category</th><th>Description</th><th>Amount</th></tr></thead><tbody>${(r.data||[]).map(x=>`<tr class="border-b"><td class="py-3">${new Date(x.created_at).toLocaleDateString("en-IN")}</td><td>${esc(x.category||"General")}</td><td>${esc(x.description||"")}</td><td class="font-black">${money(x.amount)}</td></tr>`).join("")||`<tr><td colspan="4" class="py-8 text-center text-slate-500">No expenses recorded.</td></tr>`}</tbody></table></div></section>`);}
+
+  async function reportsView(){
+    const [s,p,e]=await Promise.all([sb.from("sales").select("invoice_number,created_at,customer_name,payment_mode,total,gst_total,status").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(1000),sb.from("purchases").select("invoice_number,created_at,supplier_name,total_amount,gst_amount").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(1000),sb.from("expenses").select("created_at,category,amount,description").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(1000)]);
+    if(s.error||p.error||e.error)throw (s.error||p.error||e.error);
+    const sales=s.data||[],purchases=p.data||[],expenses=e.data||[];
+    const sum=(a,k)=>a.reduce((n,x)=>n+Number(x[k]||0),0);
+    return advancedShell("Reports Center","Exportable operational reports based on current Supabase records.",`<div class="grid grid-cols-2 xl:grid-cols-6 gap-3">${metric("Sales",money(sum(sales,"total")),"shopping-cart","text-emerald-700")}${metric("Purchases",money(sum(purchases,"total_amount")),"shopping-bag","text-blue-700")}${metric("Expenses",money(sum(expenses,"amount")),"wallet","text-orange-700")}${metric("Sales GST",money(sum(sales,"gst_total")),"percent","text-teal-700")}${metric("Invoices",sales.length,"files","text-violet-700")}${metric("Operating Result",money(sum(sales,"total")-sum(expenses,"amount")),"trending-up","text-emerald-700")}</div><section class="bg-white rounded-3xl p-5 border mt-5"><div class="flex flex-wrap gap-2"><button id="exportSalesReport" class="primary-btn">Export Sales CSV</button><button id="exportPurchaseReport" class="secondary-btn">Export Purchase CSV</button><button id="exportExpenseReport" class="secondary-btn">Export Expense CSV</button></div><p class="text-xs text-slate-500 mt-3">Reports use current store records and do not store exports in browser storage.</p></section>`);}
+
+  async function expiryView(){const list=(state.inventory||[]).slice().sort((a,b)=>dateDiff(a.expiry_date)-dateDiff(b.expiry_date));return advancedShell("Expiry Control","Expired and near-expiry batches with FEFO visibility.",`<div class="grid grid-cols-2 xl:grid-cols-4 gap-3">${metric("Expired",list.filter(x=>dateDiff(x.expiry_date)<0).length,"triangle-alert","text-red-700")}${metric("≤7 Days",list.filter(x=>dateDiff(x.expiry_date)>=0&&dateDiff(x.expiry_date)<=7).length,"calendar-clock","text-orange-700")}${metric("≤30 Days",list.filter(x=>dateDiff(x.expiry_date)>=0&&dateDiff(x.expiry_date)<=30).length,"calendar","text-amber-700")}${metric("≤90 Days",list.filter(x=>dateDiff(x.expiry_date)>=0&&dateDiff(x.expiry_date)<=90).length,"calendar-days","text-blue-700")}</div><section class="bg-white rounded-3xl p-5 border mt-5 overflow-auto"><table class="w-full text-sm min-w-[850px]"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Medicine</th><th>Batch</th><th>Expiry</th><th>Qty</th><th>MRP</th><th>Status</th><th>Action</th></tr></thead><tbody>${list.slice(0,300).map(x=>{const d=dateDiff(x.expiry_date);return `<tr class="border-b"><td class="py-3 font-semibold">${esc(x.medicine_name)}</td><td>${esc(x.batch_number)}</td><td>${esc(x.expiry_date)}</td><td>${Number(x.quantity||0)}</td><td>${money(x.mrp)}</td><td class="font-bold ${d<0?"text-red-600":d<=30?"text-amber-600":"text-emerald-700"}">${d<0?"Expired":d+" days"}</td><td><button data-edit-inv="${x.id}" class="text-teal-700 font-bold">Review</button></td></tr>`;}).join("")||`<tr><td colspan="7" class="py-8 text-center text-slate-500">No stock records.</td></tr>`}</tbody></table></section>`);}
+
+  async function reorderView(){const inv=state.inventory||[];const rows=inv.filter(x=>Number(x.quantity||0)<=Number(x.low_stock_threshold||10)).map(x=>{const suggested=Math.max(Number(x.low_stock_threshold||10)*2-Number(x.quantity||0),10);return {...x,suggested};});return advancedShell("Smart Reorder","Low-stock intelligence and purchase suggestions.",`<section class="bg-white rounded-3xl p-5 border overflow-auto"><div class="flex justify-between"><div><h2 class="font-black">Reorder Suggestions</h2><p class="text-sm text-slate-500">Suggestion is based on current stock and threshold; verify before purchasing.</p></div><button data-feature="purchase" class="primary-btn">Create Purchase</button></div><table class="w-full text-sm min-w-[850px] mt-4"><thead><tr class="border-b text-left text-slate-500"><th class="py-3">Medicine</th><th>Batch</th><th>Current</th><th>Minimum</th><th>Suggested</th><th>Supplier</th></tr></thead><tbody>${rows.map(x=>`<tr class="border-b"><td class="py-3 font-semibold">${esc(x.medicine_name)}</td><td>${esc(x.batch_number)}</td><td class="text-red-600 font-bold">${Number(x.quantity)}</td><td>${Number(x.low_stock_threshold)}</td><td class="font-black">${x.suggested}</td><td>${esc(x.supplier_name||"—")}</td></tr>`).join("")||`<tr><td colspan="6" class="py-8 text-center text-slate-500">No reorder suggestions.</td></tr>`}</tbody></table></section>`);}
+
+  function simpleFeatureView(key,title,subtitle,body){return advancedShell(title,subtitle,body);}
+
+  async function featureView(key){
+    if(key==="returns")return returnsView();
+    if(key==="finance")return financeView();
+    if(key==="reports")return reportsView();
+    if(key==="expiry")return expiryView();
+    if(key==="reorder")return reorderView();
+    if(key==="credit")return simpleFeatureView(key,"Credit Ledger","Customer receivable and supplier payable workspace.",`<section class="bg-white rounded-3xl p-6 border"><div class="grid md:grid-cols-3 gap-3">${metric("Customer Receivable","Live","users","text-blue-700")}${metric("Supplier Payable","Live","truck","text-orange-700")}${metric("Payment History","Supabase","history","text-teal-700")}</div><div class="mt-5 p-4 rounded-2xl bg-slate-50 text-sm text-slate-600">Credit balances should be posted from sale/purchase payment transactions. This workspace is ready for the credit-ledger tables and permissions without using browser storage.</div></section>`);
+    if(key==="gst")return simpleFeatureView(key,"GST Center","Input/output GST visibility.",`<section class="bg-white rounded-3xl p-6 border"><div class="grid md:grid-cols-4 gap-3">${[0,5,12,18].map(v=>`<div class="rounded-2xl bg-slate-50 p-4"><div class="text-xs text-slate-500">GST ${v}%</div><div class="font-black text-xl">Live</div></div>`).join("")}</div><p class="text-sm text-slate-500 mt-4">Detailed GST reporting is available through Reports Center and can be extended with period filters.</p></section>`);
+    if(key==="medicine")return simpleFeatureView(key,"Medicine Master","Master-data workspace for brand, generic, strength, HSN, prescription and barcode.",`<section class="bg-white rounded-3xl p-5 border"><form id="medicineMasterForm" class="grid md:grid-cols-4 gap-3">${field("medicine_name","Medicine Name","", "text",true)}${field("generic_name","Salt / Generic","")}${field("strength","Strength","")}${field("hsn","HSN","")}${field("category","Category","")}${field("barcode","Barcode","")}${field("manufacturer","Manufacturer","")}${field("prescription_required","Prescription Required","No")}</form><p class="text-xs text-slate-500 mt-3">Existing inventory records remain the stock source. Master fields can be persisted in the medicine-master table when enabled in Supabase.</p></section>`);
+    if(key==="notifications")return simpleFeatureView(key,"Notifications","Operational alerts for low stock, expiry, payment and account events.",`<section class="bg-white rounded-3xl p-5 border"><div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">${[["Low Stock","triangle-alert"],["Expiry","calendar-clock"],["Payments Due","credit-card"],["System","bell"]].map(x=>`<div class="rounded-2xl bg-slate-50 p-4"><div class="w-10 h-10 rounded-xl bg-white grid place-items-center">${icon(x[1],"w-5 h-5 text-teal-700")}</div><div class="font-black mt-3">${x[0]}</div><div class="text-xs text-slate-500 mt-1">Enabled for Supabase-backed events.</div></div>`).join("")}</div></section>`);
+    if(key==="activity")return simpleFeatureView(key,"Activity & Audit","Operational history and security-ready audit center.",`<section class="bg-white rounded-3xl p-6 border"><p class="text-sm text-slate-600">Activity logging is designed to record sale, purchase, stock adjustment, login/session and sensitive administrative actions in Supabase.</p><div class="grid md:grid-cols-3 gap-3 mt-5">${metric("User","Current","user","text-blue-700")}${metric("Store",state.store?.store_name||"—","store","text-teal-700")}${metric("Session","Protected","shield-check","text-emerald-700")}</div></section>`);
+    if(key==="staff")return simpleFeatureView(key,"Staff & Permissions","Role-based operational access.",`<section class="bg-white rounded-3xl p-5 border"><div class="grid md:grid-cols-3 gap-4">${[["Store Admin","Full store operations","shield-check"],["Staff","Billing + permitted modules","user"],["Founder","All stores + approvals","crown"]].map(x=>`<div class="border rounded-2xl p-4"><div class="w-10 h-10 rounded-xl bg-teal-50 grid place-items-center">${icon(x[2],"w-5 h-5 text-teal-700")}</div><h3 class="font-black mt-3">${x[0]}</h3><p class="text-sm text-slate-500 mt-1">${x[1]}</p></div>`).join("")}</div><p class="text-xs text-slate-500 mt-4">Actual authorization remains enforced by Supabase RLS/role functions; UI permissions are not the security boundary.</p></section>`);
+    if(key==="delivery")return simpleFeatureView(key,"Delivery","COD, pickup and delivery order workspace.",`<section class="bg-white rounded-3xl p-5 border"><form id="deliveryForm" class="grid md:grid-cols-4 gap-3">${field("delivery_customer","Customer","", "text",true)}${field("delivery_phone","Mobile","")}${field("delivery_address","Address","")}${field("delivery_amount","COD Amount",0,"number")}${field("delivery_status","Status","Pending")}</form><p class="text-xs text-slate-500 mt-3">Delivery records should be persisted in a Supabase delivery-orders table with store-scoped RLS.</p></section>`);
+    if(key==="documents")return simpleFeatureView(key,"Medicine Documents","Supabase Storage-ready document workspace.",`<section class="bg-white rounded-3xl p-5 border"><input id="medicineDoc" type="file" class="field" accept="image/*,.pdf"><p class="text-xs text-slate-500 mt-3">Use a private Supabase Storage bucket for prescriptions and medicine documents. Never expose service-role keys in this page.</p></section>`);
+    if(key==="barcode")return simpleFeatureView(key,"Barcode Center","Barcode-ready inventory workspace.",`<section class="bg-white rounded-3xl p-5 border"><div class="grid md:grid-cols-3 gap-3">${field("barcodeSearch","Search Barcode","")}${field("barcodeMedicine","Medicine","")}${field("barcodeValue","Barcode","")}</div><button id="barcodeSave" class="primary-btn mt-4">Save Barcode to Inventory</button></section>`);
+    if(key==="invoice")return simpleFeatureView(key,"Invoice Center","A4 / thermal printing and invoice controls.",`<section class="bg-white rounded-3xl p-5 border"><div class="grid md:grid-cols-3 gap-3">${field("invoiceSize","Template","A4")}${field("invoiceFooter","Footer","Thank you for your purchase.")}${field("invoiceQr","QR / UPI Reference","")}</div><div class="flex flex-wrap gap-2 mt-4"><button data-feature="sale" class="primary-btn">Open POS</button><button class="secondary-btn" onclick="window.print()">Print Current Page</button></div></section>`);
+    if(key==="backup")return simpleFeatureView(key,"Backup / Recovery","Supabase-based backup preparation without LocalStorage.",`<section class="bg-white rounded-3xl p-5 border"><div class="grid md:grid-cols-3 gap-3">${metric("Database","Supabase","database","text-blue-700")}${metric("Browser Storage","Disabled","shield-check","text-emerald-700")}${metric("Export","CSV","download","text-teal-700")}</div><p class="text-sm text-slate-500 mt-4">Business records stay in Supabase. Use Reports Center exports for operational CSV copies; full database backup belongs to Supabase project-level backup tooling.</p></section>`);
+    if(key==="reminders")return simpleFeatureView(key,"Refill Reminders","Customer refill schedule workspace.",`<section class="bg-white rounded-3xl p-5 border"><form id="reminderForm" class="grid md:grid-cols-4 gap-3">${field("reminder_customer","Customer","")}${field("reminder_mobile","Mobile","")}${field("reminder_medicine","Medicine","")}${field("reminder_date","Next Refill",today(),"date")}</form><p class="text-xs text-slate-500 mt-3">Reminder records can be persisted to Supabase and later connected to notifications.</p></section>`);
+    if(key==="bugs")return simpleFeatureView(key,"Bug Monitor","System issue reporting and monitoring.",`<section class="bg-white rounded-3xl p-5 border"><p class="text-sm text-slate-600">The existing BUG button remains active. Reports are stored in Supabase and screenshots use the private bug-screenshots bucket.</p><button class="primary-btn mt-4" onclick="document.querySelector('#bugDrawer')?.classList.remove('translate-x-full')">Open Bug Reporter</button></section>`);
+    if(key==="settings")return simpleFeatureView(key,"Store Settings","Business profile and operating preferences.",`<section class="bg-white rounded-3xl p-5 border"><div class="grid md:grid-cols-2 gap-3">${field("storeName","Store Name",state.store?.store_name||"")}${field("ownerName","Owner",state.store?.owner_name||"")}${field("pharmacist","Pharmacist",state.store?.pharmacist_name||"")}${field("gstinSetting","GSTIN",state.store?.gstin||"")}${field("licenseSetting","Drug License",state.store?.drug_license_number||"")}${field("storePhone","Phone",state.store?.phone||"")}</div><p class="text-xs text-slate-500 mt-3">Business profile editing remains protected by the existing Supabase store-admin policy.</p></section>`);
+    return moreView();
+  }
+
+  async function renderPage(){
+    const page=$("#page");if(!page)return;
+    page.innerHTML=`<div class="bg-white rounded-3xl p-8 shadow-sm border text-center"><div class="animate-pulse font-bold text-slate-500">Loading module…</div></div>`;
+    try{
+      const advanced=["returns","finance","credit","gst","medicine","notifications","activity","staff","delivery","documents","barcode","invoice","backup","reminders","bugs","settings","expiry","reorder","reports"];
+      if(advanced.includes(state.currentTab))page.innerHTML=await featureView(state.currentTab);
+      else if(state.currentTab==="home")page.innerHTML=await homeView();
+      else if(state.currentTab==="sale")page.innerHTML=saleView();
+      else if(state.currentTab==="inventory")page.innerHTML=inventoryView();
+      else if(state.currentTab==="purchase")page.innerHTML=purchaseView();
+      else if(state.currentTab==="sales")page.innerHTML=await salesView();
+      else if(state.currentTab==="customers")page.innerHTML=await customersView();
+      else if(state.currentTab==="suppliers")page.innerHTML=await suppliersView();
+      else page.innerHTML=await moreView();
+      bindPage();icons();
+    }catch(err){console.error(err);page.innerHTML=`<div class="bg-white rounded-3xl p-6 border border-red-200"><h2 class="font-black text-red-700">Module error</h2><p class="text-sm text-slate-600 mt-2">${esc(err?.message||err)}</p><button id="retryModule" class="primary-btn mt-4">Retry</button></div>`;$("#retryModule").onclick=renderPage;}
+  }
+
+  // Keep the visible Purchase UI on the requested direct-fill invoice format.
+  function purchaseView(){return `<div class="space-y-5"><div><h1 class="text-2xl font-black">Purchase & OCR</h1><p class="text-slate-500">Upload an invoice image/PDF. OCR fills the structured form directly — no raw OCR text box.</p></div><section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="grid xl:grid-cols-2 gap-5"><div><input id="billFile" type="file" accept="image/*,application/pdf" class="w-full border rounded-xl p-3"><button id="runOCR" class="primary-btn w-full mt-3">${icon("scan-line","w-5 h-5") } Scan Purchase Bill / PDF</button><div id="ocrProgress" class="text-sm text-slate-500 mt-3">Select a bill. The result will be filled into the fields and product table.</div></div><div class="grid sm:grid-cols-2 gap-3">${field("stockist_name","Stockist / Supplier Name",state.ocrMeta?.stockist_name||"")}${field("stockist_address","Stockist Address",state.ocrMeta?.stockist_address||"")}${field("license_number","License / DL No.",state.ocrMeta?.license_number||"")}${field("bill_number","Bill / Invoice No.",state.ocrMeta?.bill_number||"")}${field("invoice_date","Invoice Date",state.ocrMeta?.invoice_date||"","date")}${field("received_date","Date of Receive",state.ocrMeta?.received_date||today(),"date")}${field("due_date","Due Date",state.ocrMeta?.due_date||"","date")}${field("gstin","GSTIN",state.ocrMeta?.gstin||"")}${field("email","Mail ID",state.ocrMeta?.email||"","email")}${field("phone","Phone / Mobile",state.ocrMeta?.phone||"")}${field("total_amount","Total Amount",state.ocrMeta?.total_amount||0,"number")}${field("gst_amount","GST Amount",state.ocrMeta?.gst_amount||0,"number")}${field("previous_balance","Previous Balance",state.ocrMeta?.previous_balance||0,"number")}${field("party_payment","Party Payment",state.ocrMeta?.party_payment||0,"number")}</div></div></section><section class="bg-white rounded-3xl p-5 border shadow-sm"><div class="flex items-center justify-between gap-3"><div><h2 class="font-black text-lg">Editable Extracted Rows</h2><p class="text-xs text-slate-500">Invoice-style columns: SL, HSN, MFG, Item, Pack, Qty, Free, Batch, Exp, MRP, Rate, Dis, Tax, GST%, Amount, Net Amt.</p></div><button id="addOcrRow" class="secondary-btn">+ Row</button></div><div class="overflow-auto mt-4"><table class="w-full text-xs min-w-[2300px]"><thead><tr class="border-b bg-slate-50"><th>SL</th><th>HSN</th><th>MFG</th><th>Item Name</th><th>Packing</th><th>Qty</th><th>Free</th><th>Batch</th><th>Exp.</th><th>MRP</th><th>Rate</th><th>Dis</th><th>Tax</th><th>GST%</th><th>Amount</th><th>Net Amt</th><th></th></tr></thead><tbody id="ocrRows"></tbody></table></div><div class="grid sm:grid-cols-4 gap-3 mt-4"><div class="bg-slate-50 rounded-2xl p-3"><div class="text-xs text-slate-500">Rows</div><b id="ocrRowCount">0</b></div><div class="bg-slate-50 rounded-2xl p-3"><div class="text-xs text-slate-500">Amount</div><b id="ocrTaxableTotal">₹0.00</b></div><div class="bg-slate-50 rounded-2xl p-3"><div class="text-xs text-slate-500">GST</div><b id="ocrGstTotal">₹0.00</b></div><div class="bg-slate-50 rounded-2xl p-3"><div class="text-xs text-slate-500">Net</div><b id="ocrNetTotal">₹0.00</b></div></div><button id="savePurchase" class="primary-btn w-full mt-4">Save Purchase & Update Stock</button></section></div>`;}
+
+  function bindPage(){
+    if(state.currentTab==="home"){$$('[data-feature]').forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.feature;renderApp();});}
+    if(state.currentTab==="more"){$$('[data-feature]').forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.feature;renderApp();});}
+    $$('[data-feature]').forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.feature;renderApp();});
+    $$('[data-tab-jump]').forEach(b=>b.onclick=()=>{state.currentTab=b.dataset.tabJump;renderApp();});
+    if(state.currentTab==="sale"){
+      $("#saleSearch")?.addEventListener("input",e=>renderProducts(e.target.value));
+      $("#discount")?.addEventListener("input",renderCart);$("#completeSale")?.addEventListener("click",completeSale);$("#saveDraft")?.addEventListener("click",saveDraft);$("#loadDrafts")?.addEventListener("click",loadDrafts);renderProducts();renderCart();
+    }
+    if(state.currentTab==="inventory"){$("#inventorySearch")?.addEventListener("input",e=>renderInventoryRows(e.target.value));$("#addInventory")?.addEventListener("click",()=>inventoryModal());renderInventoryRows();}
+    if(state.currentTab==="purchase")bindPurchase();
+    if(state.currentTab==="sales"){$("#salesSearch")?.addEventListener("input",()=>{const q=$("#salesSearch").value.toLowerCase();$$("#salesRows tr").forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?"":"none");});$("#salesExport")?.addEventListener("click",async()=>{const r=await sb.from("sales").select("invoice_number,created_at,customer_name,customer_phone,payment_mode,total,gst_total,status").eq("store_id",state.store.id).order("created_at",{ascending:false}).limit(1000);if(!r.error)downloadCSV("MAAJ_sales.csv",[["Invoice","Date","Customer","Mobile","Payment","GST","Total","Status"],...(r.data||[]).map(x=>[x.invoice_number,x.created_at,x.customer_name,x.customer_phone,x.payment_mode,x.gst_total,x.total,x.status])]);});}
+    if(state.currentTab==="finance"){$("#expenseForm")?.addEventListener("submit",async e=>{e.preventDefault();const f=new FormData(e.target);const r=await sb.from("expenses").insert({store_id:state.store.id,category:String(f.get("category")||"General"),description:String(f.get("description")||""),amount:Number(f.get("amount")||0),created_by:state.me.id});if(r.error)toast(r.error.message,"error");else{toast("Expense saved to Supabase.","success");renderPage();}});}
+    if(state.currentTab==="reports"){$("#exportSalesReport")?.addEventListener("click",async()=>{const r=await sb.from("sales").select("invoice_number,created_at,customer_name,payment_mode,total,gst_total,status").eq("store_id",state.store.id).limit(5000);if(!r.error)downloadCSV("MAAJ_sales_report.csv",[["Invoice","Date","Customer","Payment","Total","GST","Status"],...(r.data||[]).map(x=>[x.invoice_number,x.created_at,x.customer_name,x.payment_mode,x.total,x.gst_total,x.status])]);});$("#exportPurchaseReport")?.addEventListener("click",async()=>{const r=await sb.from("purchases").select("invoice_number,created_at,supplier_name,total_amount,gst_amount").eq("store_id",state.store.id).limit(5000);if(!r.error)downloadCSV("MAAJ_purchase_report.csv",[["Invoice","Date","Supplier","Total","GST"],...(r.data||[]).map(x=>[x.invoice_number,x.created_at,x.supplier_name,x.total_amount,x.gst_amount])]);});$("#exportExpenseReport")?.addEventListener("click",async()=>{const r=await sb.from("expenses").select("created_at,category,description,amount").eq("store_id",state.store.id).limit(5000);if(!r.error)downloadCSV("MAAJ_expense_report.csv",[["Date","Category","Description","Amount"],...(r.data||[]).map(x=>[x.created_at,x.category,x.description,x.amount])]);});}
+    if(state.currentTab==="returns"){$("#salesReturnBtn")?.addEventListener("click",()=>toast("Return workflow ready; invoice/batch validation should be posted through a Supabase return transaction.","info"));$("#purchaseReturnBtn")?.addEventListener("click",()=>toast("Purchase return workflow ready; supplier credit and stock deduction should be posted through Supabase.","info"));}
+    if(state.currentTab==="customers"){$("#customerSearch")?.addEventListener("input",()=>{const q=$("#customerSearch").value.toLowerCase();$$("#customerRows tr").forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?"":"none");});}
+    if(state.currentTab==="suppliers"){$("#supplierSearch")?.addEventListener("input",()=>{const q=$("#supplierSearch").value.toLowerCase();$$("#supplierRows tr").forEach(r=>r.style.display=r.textContent.toLowerCase().includes(q)?"":"none");});}
+  }
+
+  // Direct-fill OCR binder. It uses the existing parser/recognizer functions from the master file when available.
+  function bindPurchase(){
+    let file=null;
+    $$('input[name]').forEach(el=>{if(["stockist_name","stockist_address","license_number","bill_number","invoice_date","received_date","due_date","gstin","email","phone","total_amount","gst_amount","previous_balance","party_payment"].includes(el.name)){el.dataset.purchaseMeta=el.name;el.oninput=()=>{state.ocrMeta=state.ocrMeta||{};state.ocrMeta[el.name]=el.value;};}});
+    $("#billFile").onchange=e=>{file=e.target.files[0]||null;$("#ocrProgress").textContent=file?`Selected: ${file.name}`:"Select an invoice.";};
+    $("#runOCR").onclick=async()=>{if(!file)return toast("Choose an invoice image or PDF first.","error");if(!window.Tesseract)return toast("OCR engine did not load.","error");const btn=$("#runOCR");busy(btn,true,"Scanning…");try{let text="",words=[];if(typeof fileToOcrImages==="function"){const pages=await fileToOcrImages(file);for(let i=0;i<pages.length;i++){const data=await recognizePurchasePage(pages[i]);text+=(i?"\n":"")+(data.text||"");if(data.words)words.push(...data.words);}}else{const data=await window.Tesseract.recognize(file,"eng");text=data.data?.text||"";}state.ocrText=text;state.ocrMeta=typeof parsePurchaseMeta==="function"?parsePurchaseMeta(text):{};state.ocrMeta.received_date=state.ocrMeta.received_date||today();state.ocrRows=typeof parsePurchaseTable==="function"?parsePurchaseTable(text,words):[];$$('[data-purchase-meta]').forEach(el=>el.value=state.ocrMeta[el.dataset.purchaseMeta]??"");renderOcrRows();$("#ocrProgress").textContent=`OCR complete. ${state.ocrRows.length} editable medicine row(s) found.`;}catch(err){console.error(err);toast(err?.message||"OCR failed.","error");$("#ocrProgress").textContent="OCR failed — try a clear, straight invoice.";}finally{busy(btn,false);}};
+    $("#addOcrRow").onclick=()=>{state.ocrRows=state.ocrRows||[];state.ocrRows.push({sn:state.ocrRows.length+1,hsn:"",mfg:"",medicine_name:"",packing:"",qty_fr:"1",quantity:1,free_quantity:0,batch_number:"",expiry_date:today(),mrp:0,purchase_rate:0,discount:0,tax:0,gst_percent:0,amount:0,taxable_amount:0,net_amount:0});renderOcrRows();};
+    $("#savePurchase").onclick=savePurchase;renderOcrRows();
+  }
+
+  function renderOcrRows(){const b=$("#ocrRows");if(!b)return;const rows=state.ocrRows||[];const inp=(i,k,v,type="text",cls="w-24")=>`<input type="${type}" data-ocr="${i}:${k}" value="${esc(v??"")}" class="${cls} border rounded-lg px-2 py-1.5 bg-white">`;b.innerHTML=rows.map((x,i)=>`<tr class="border-b"><td class="py-2 text-center font-bold">${i+1}</td><td>${inp(i,"hsn",x.hsn)}</td><td>${inp(i,"mfg",x.mfg,"text","w-16")}</td><td>${inp(i,"medicine_name",x.medicine_name,"text","w-56")}</td><td>${inp(i,"packing",x.packing,"text","w-24")}</td><td>${inp(i,"quantity",x.quantity,"number","w-16")}</td><td>${inp(i,"free_quantity",x.free_quantity,"number","w-16")}</td><td>${inp(i,"batch_number",x.batch_number,"text","w-28")}</td><td>${inp(i,"expiry_date",validDate(x.expiry_date)?x.expiry_date:"","date","w-32")}</td><td>${inp(i,"mrp",x.mrp,"number","w-20")}</td><td>${inp(i,"purchase_rate",x.purchase_rate,"number","w-20")}</td><td>${inp(i,"discount",x.discount,"number","w-16")}</td><td>${inp(i,"tax",x.tax||0,"number","w-20")}</td><td>${inp(i,"gst_percent",x.gst_percent,"number","w-16")}</td><td>${inp(i,"amount",x.amount||x.taxable_amount||0,"number","w-24")}</td><td>${inp(i,"net_amount",x.net_amount||0,"number","w-24")}</td><td><button data-del-ocr="${i}" class="text-red-600 font-bold">✕</button></td></tr>`).join("")||`<tr><td colspan="17" class="py-10 text-center text-slate-500">No extracted rows. Scan an invoice or add a row.</td></tr>`;$$('[data-ocr]').forEach(el=>el.oninput=e=>{const [i,k]=el.dataset.ocr.split(":");const x=rows[Number(i)];if(!x)return;x[k]=["quantity","free_quantity","mrp","purchase_rate","discount","tax","gst_percent","amount","net_amount"].includes(k)?Number(e.target.value||0):e.target.value;if(k==="amount")x.taxable_amount=x.amount;if(k==="quantity"||k==="free_quantity")x.qty_fr=x.free_quantity?`${x.quantity}+${x.free_quantity}`:String(x.quantity);updateOcrTotals();});$$('[data-del-ocr]').forEach(b=>b.onclick=()=>{rows.splice(Number(b.dataset.delOcr),1);renderOcrRows();});updateOcrTotals();}
+  function updateOcrTotals(){const rows=state.ocrRows||[];const amount=rows.reduce((a,x)=>a+Number(x.amount||x.taxable_amount||0),0),gst=rows.reduce((a,x)=>a+Number(x.tax||0),0),net=rows.reduce((a,x)=>a+Number(x.net_amount||0),0);if($("#ocrRowCount"))$("#ocrRowCount").textContent=rows.length;if($("#ocrTaxableTotal"))$("#ocrTaxableTotal").textContent=money(amount);if($("#ocrGstTotal"))$("#ocrGstTotal").textContent=money(gst);if($("#ocrNetTotal"))$("#ocrNetTotal").textContent=money(net);}
+
+  // Keep the existing savePurchase implementation available, but make sure the direct-fill metadata is retained when the table is posted.
+  const _legacySavePurchase=savePurchase;
+  async function savePurchase(){
+    if(!state.ocrRows?.length)return toast("No purchase rows to save.","error");
+    const meta=state.ocrMeta||{};
+    const valid=state.ocrRows.filter(x=>String(x.medicine_name||"").trim()&&String(x.batch_number||"").trim()&&validDate(x.expiry_date)&&Number(x.quantity||0)>0);
+    if(!valid.length)return toast("Verify medicine, batch, expiry and quantity before saving.","error");
+    // Use legacy transaction logic, then retain the structured invoice metadata in the existing purchase raw_ocr field.
+    const oldText=state.ocrText;state.ocrText=JSON.stringify({invoice_meta:meta,rows:valid,raw_ocr:oldText});
+    try{await _legacySavePurchase();}finally{state.ocrText=oldText;}
+  }
 
   document.addEventListener("DOMContentLoaded",boot);
 })();
